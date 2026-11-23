@@ -217,6 +217,14 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsWaterfal
     DEPENDS tests/gpu_alias_atomic_waterfall.hlsl
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsWaterfall.cso" VERBATIM)
 target_sources(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsWaterfall.h")
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsReturns.h" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0
+    -E ProbeArrayAtomicsWaterfallReturns -Vn ProbeArrayAtomicsReturns
+    -Fh "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsReturns.h"
+    -Fo "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsReturns.cso"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/gpu_alias_atomic_returns.hlsl"
+    DEPENDS tests/gpu_alias_atomic_returns.hlsl
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsReturns.cso" VERBATIM)
+target_sources(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomicsReturns.h")
 target_include_directories(offscreen_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.h" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0
     -E AliasTransform -Vn AliasTransform -Fh "${CMAKE_CURRENT_BINARY_DIR}/AliasTransform.h"

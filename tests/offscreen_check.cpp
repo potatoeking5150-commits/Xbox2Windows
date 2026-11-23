@@ -856,6 +856,12 @@ OperationResult run_gpu_alias_atomic_waterfall(const OperationContext& ctx)
         return {OutcomeKind::fail, "Waterfall atomic counts differ from the reference"};
     return {OutcomeKind::pass, nullptr};
 }
+OperationResult run_gpu_alias_atomic_returns(const OperationContext& ctx)
+{
+    if (!check_gpu_alias_atomic_returns(ctx.device))
+        return {OutcomeKind::fail, "Waterfall atomic return values are incorrect"};
+    return {OutcomeKind::pass, nullptr};
+}
 OperationResult run_gpu_alias_registry(const OperationContext& ctx)
 {
     return skip_if_false(check_gpu_alias_registry(ctx.device));
@@ -1003,6 +1009,7 @@ const OperationSpec kOperations[] = {
     {"--gpu-alias-lookup", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup},
     {"--gpu-alias-lookup-writes", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup_writes},
     {"--gpu-alias-atomic-waterfall", 3, 3, nullptr, kGateSm60AtomicWaterfall, run_gpu_alias_atomic_waterfall},
+    {"--gpu-alias-atomic-returns", 3, 3, nullptr, kGateSm60AtomicWaterfall, run_gpu_alias_atomic_returns},
     {"--gpu-alias-registry", 3, 3, nullptr, kNoGate, run_gpu_alias_registry},
     {"--buffer-ops", 3, 3, nullptr, kGateSm60BufferOps, run_buffer_ops},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
