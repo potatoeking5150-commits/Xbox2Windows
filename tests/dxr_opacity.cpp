@@ -29,7 +29,7 @@ static bool committed_mismatch(bool identity, bool candidateMatches, double dist
     return !identity || !candidateMatches || !matches(distance, wanted);
 }
 
-bool check_dxr_opacity(ID3D12Device* device, bool warp) {
+bool check_dxr_opacity(ID3D12Device* device, bool warp, bool usePipeline) {
     // The geometric reference must reproduce the hand-derived table on every
     // machine, including those that skip the GPU comparison.
     const auto scene = dxr_opacity::instances();
@@ -40,7 +40,8 @@ bool check_dxr_opacity(ID3D12Device* device, bool warp) {
         throw std::runtime_error("Opacity reference disagrees with its hand-derived table");
     if (committed_mismatch(true, true, 2.0, 2.0) || !committed_mismatch(true, true, 2.0 + 0.25, 2.0))
         throw std::runtime_error("Committed distance control failed to distinguish an injected TMin offset");
-    if (!dxr_fixture::supported(device)) return false;
+    const auto backend = usePipeline ? dxr_fixture::Backend::pipeline : dxr_fixture::Backend::inline_query;
+    if (!dxr_fixture::supported(device, backend)) return false;
     std::vector<dxr_fixture::Vertex> vertices(mesh.begin(), mesh.end());
     std::vector<D3D12_RAYTRACING_GEOMETRY_FLAGS> geometries;
     for (const auto value : flags) geometries.push_back(static_cast<D3D12_RAYTRACING_GEOMETRY_FLAGS>(value));
@@ -54,8 +55,8 @@ bool check_dxr_opacity(ID3D12Device* device, bool warp) {
     for (const auto& probe : probes)
         rays.push_back({probe.origin[0], probe.origin[1], probe.origin[2], probe.nearT,
                         probe.direction[0], probe.direction[1], probe.direction[2], probe.farT, 255, probe.flags});
-    const auto words = dxr_fixture::trace(device, vertices, instances, rays,
-        dxr_fixture::Backend::inline_query, nullptr, &geometries);
+    const auto words = dxr_fixture::trace(device, vertices, instances, rays, backend, nullptr, &geometries);
+    const bool allowWarpContinuation = warp && !usePipeline;
     UINT hits = 0, shaderCommits = 0, firstHitRays = 0, mismatches = 0, warpAfterCommit = 0, plusTMin = 0;
     UINT counts[CategoryCount]{};
     for (UINT i = 0; i < rays.size(); ++i) {
@@ -99,11 +100,11 @@ bool check_dxr_opacity(ID3D12Device* device, bool warp) {
         const bool afterCommit = failed[AfterShaderCommit] || failed[AfterOpaqueCommit];
         bool other = false;
         for (int c = 0; c < AfterShaderCommit; ++c) other = other || failed[c];
-        // Known WARP deviation: WARP does not end a first-hit search at a
+        // Known inline WARP deviation: WARP does not end a first-hit search at a
         // committed hit, automatic or shader. It is reported, not failed, only
         // when the final hit is committable and every other check passes.
         plusTMin += tPlusTMin;
-        if (!other && (!afterCommit || warp)) {
+        if (!other && (!afterCommit || allowWarpContinuation)) {
             warpAfterCommit += afterCommit;
             continue;
         }
@@ -131,7 +132,7 @@ bool check_dxr_opacity(ID3D12Device* device, bool warp) {
                 rays.size(), hits, shaderCommits, rays.size() - hits, firstHitRays, mismatches);
     for (int c = 0; c < CategoryCount; ++c)
         if (counts[c]) std::printf(" %s=%u", categoryNames[c], counts[c]);
-    if (warp) std::printf(" warp_after_commit=%u", warpAfterCommit);
+    if (allowWarpContinuation) std::printf(" warp_after_commit=%u", warpAfterCommit);
     std::printf(" committed_t_plus_tmin=%u", plusTMin);
     std::printf("\n");
     if (mismatches) throw std::runtime_error("DXR opacity or candidate handling disagrees with the CPU reference");

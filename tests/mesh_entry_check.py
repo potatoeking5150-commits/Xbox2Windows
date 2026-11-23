@@ -197,28 +197,30 @@ def binary(tmp, assembler, objcopy, library, *, program=None, words=None, header
     geometry = tmp / "geometry.json"
     geometry.write_text(json.dumps(words if words is not None else [4099]))
     tool = Path(__file__).resolve().parents[1] / "tools" / "mesh_entry_aot.py"
-    subprocess.run(
-        [
-            sys.executable,
-            "-B",
-            tool,
-            container,
-            "--llvm",
-            library,
-            "--output",
-            translated,
-            *(["--vertex-header", str(header)] if header is not None else []),
-            "--geometry-words",
-            geometry,
-        ],
-        check=True,
-    )
+    command = [
+        sys.executable,
+        "-B",
+        tool,
+        container,
+        "--llvm",
+        library,
+        "--output",
+        translated,
+        *(["--vertex-header", str(header)] if header is not None else []),
+        "--geometry-words",
+        geometry,
+    ]
+    subprocess.run(command, check=True)
     expected = (
         source()
         if program is None
         else lower(enumerate_pcs(program), words, (3, 1), header)
     )
     assert translated.read_text() == expected
+    if header is not None:
+        subprocess.run([*command, "--compute-fallback"], check=True)
+        expected = lower(enumerate_pcs(program), words, (3, 1), header, compute_fallback=True)
+        assert translated.read_text() == expected
 
 
 def offset_draw():

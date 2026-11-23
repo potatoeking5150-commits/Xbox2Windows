@@ -1,0 +1,3 @@
+EXPORTS
+    rdtscp_op
+    rdtscp_unused

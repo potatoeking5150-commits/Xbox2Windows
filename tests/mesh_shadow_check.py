@@ -74,12 +74,12 @@ def shadow_map(casters):
     return texels
 
 
-def caster_light(shear):
-    return [project(ndc(corner), shear, CASTER_DEPTH) for corner in CASTER]
+def caster_light(shear, corners=CASTER):
+    return [project(ndc(corner), shear, CASTER_DEPTH) for corner in corners]
 
 
-def light_casters(shear, hidden):
-    casters = [(caster_light(shear), CASTER_DEPTH)]
+def light_casters(shear, hidden, corners=CASTER):
+    casters = [(caster_light(shear, corners), CASTER_DEPTH)]
     if hidden:
         casters.append(([ndc(corner) for corner in HIDDEN], HIDDEN_DEPTH))
     return casters
@@ -91,9 +91,9 @@ def exact16(value):
     return value
 
 
-def scene_image(texels, compare="LESS", *, use_map=True):
+def scene_image(texels, compare="LESS", *, use_map=True, corners=CASTER):
     """Exact expected colours: the lit caster over the receiver, the receiver lit or in shadow."""
-    caster = [ndc(corner) for corner in CASTER]
+    caster = [ndc(corner) for corner in corners]
     pixels = bytearray()
     shadowed = 0
     for y in range(SIDE):
@@ -140,13 +140,13 @@ def light_draws(shear, hidden):
     return [draw_inputs([(*point, depth) for point in triangle]) for triangle, depth in light_casters(shear, hidden)]
 
 
-def camera_draws():
+def camera_draws(corners=CASTER):
     receiver_uv = []
     for point in RECEIVER:
         lx, ly = project(point, LIGHT_SHEAR, RECEIVER_DEPTH)
         receiver_uv.append(((lx + 1) / 2, (1 - ly) / 2, 0))
     receiver = draw_inputs([(*point, RECEIVER_DEPTH) for point in RECEIVER], receiver_uv, reference=RECEIVER_DEPTH)
-    caster = [ndc(corner) for corner in CASTER]
+    caster = [ndc(corner) for corner in corners]
     normals = [(x - CENTRE[0], y - CENTRE[1], NORMAL_Z) for x, y in caster]
     lit = draw_inputs([(*point, CASTER_DEPTH) for point in caster], normals, light=SHADE_LIGHT)
     return [receiver, lit]

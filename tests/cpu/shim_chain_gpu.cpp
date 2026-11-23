@@ -1,3 +1,7 @@
+#include "../desktop_gpu.h"
+#include "../mesh_shadow_draw.h"
+#include <cstdlib>
+#include <filesystem>
 // Run the translated compute -> mesh -> pixel chain for one EXE-requested frame.
 //
 // This repeats the sequence of `offscreen_check --compute-mesh-texture`
@@ -14,10 +18,12 @@
 #include <wrl/client.h>
 
 #include <cstdio>
+#include <cstddef>
 #include <cstring>
 #include <cwchar>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -31,6 +37,28 @@ constexpr UINT trace_bytes = 80;
 constexpr UINT image_bytes = side * side * 4;
 
 struct Failure {};
+
+struct ShadowDeviceArguments {
+    IUnknown* adapter = nullptr;
+    const IID* iid = nullptr;
+    void* device = nullptr;
+};
+static_assert(offsetof(ShadowDeviceArguments, adapter) == 0);
+static_assert(offsetof(ShadowDeviceArguments, iid) == 8);
+static_assert(offsetof(ShadowDeviceArguments, device) == 16);
+
+struct ShadowRequest : ShadowDeviceArguments {
+    ComPtr<IDXGIFactory6> factory;
+    ComPtr<IDXGIAdapter1> selected;
+    ComPtr<ID3D12Device> created_device;
+    std::unique_ptr<MeshShadowDraw> scene;
+    DWORD mode = 0;
+};
+
+ShadowRequest* shadow_request(void* args)
+{
+    return static_cast<ShadowRequest*>(static_cast<ShadowDeviceArguments*>(args));
+}
 
 void require(HRESULT hr, const char* operation)
 {
@@ -62,11 +90,9 @@ std::vector<char> read_input(const char* name)
 // WARP by default. "hardware" takes the first physical D3D12 adapter in high-performance
 // order or, with XBOX2WINDOWS_ADAPTER, the first whose description contains that value.
 // No physical adapter is a capability skip (77); a filter that matches none is an error.
-ComPtr<ID3D12Device> create_device()
+void select_adapter(ComPtr<IDXGIFactory6>& factory, ComPtr<IDXGIAdapter1>& adapter)
 {
-    ComPtr<IDXGIFactory6> factory;
     require(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
-    ComPtr<IDXGIAdapter1> adapter;
     char backend[16]{};
     const auto size = GetEnvironmentVariableA("X2W_SHIM_DRAW_ADAPTER", backend, sizeof(backend));
     if (!size || (size < sizeof(backend) && std::strcmp(backend, "warp") == 0)) {
@@ -102,6 +128,13 @@ ComPtr<ID3D12Device> create_device()
     } else {
         require(E_INVALIDARG, "Select draw adapter");
     }
+}
+
+ComPtr<ID3D12Device> create_device()
+{
+    ComPtr<IDXGIFactory6> factory;
+    ComPtr<IDXGIAdapter1> adapter;
+    select_adapter(factory, adapter);
     ComPtr<ID3D12Device> device;
     require(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice");
     return device;
@@ -129,15 +162,6 @@ ComPtr<ID3D12Resource> buffer(ID3D12Device* device, UINT64 bytes, D3D12_HEAP_TYP
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     desc.Flags = flags;
     return committed(device, desc, heap, state);
-}
-
-void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
-                D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
-{
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
-    list->ResourceBarrier(1, &barrier);
 }
 
 template<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Kind, typename T>
@@ -383,5 +407,116 @@ bool shim_chain_gpu(unsigned mode, std::vector<unsigned char>& published, unsign
         return true;
     } catch (Failure) {
         return false;
+    }
+}
+
+extern "C" __declspec(dllexport) void* shadow_device_request(DWORD mode)
+{
+    try {
+        auto request = std::make_unique<ShadowRequest>();
+        select_adapter(request->factory, request->selected);
+        request->mode = mode;
+        request->adapter = request->selected.Get();
+        request->iid = mode == 16 ? &__uuidof(IDXGIFactory6) : &__uuidof(ID3D12Device);
+        if (mode == 16) request->device = request->adapter;
+        return static_cast<ShadowDeviceArguments*>(request.release());
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        return nullptr;
+    } catch (const Failure&) {
+        return nullptr;
+    }
+}
+
+extern "C" __declspec(dllexport) HRESULT shadow_open(void* args, HRESULT result)
+{
+    try {
+        auto* request = shadow_request(args);
+        if (request->mode == 16) {
+            if (result != E_NOINTERFACE || request->device || !request->selected || !request->factory)
+                fail("Unexpected rejected shim device or missing adapter ownership");
+            request->selected.Reset();
+            request->factory.Reset();
+            std::fputs("Xbox device rejected: no device, released adapter and factory\n", stderr);
+            return E_NOINTERFACE;
+        }
+        require(result, "D3D12XboxCreateDevice");
+        if (!request->device) fail("D3D12XboxCreateDevice returned no device");
+        request->created_device.Attach(static_cast<ID3D12Device*>(request->device));
+        request->selected.Reset();
+        request->factory.Reset();
+        std::fputs("Xbox device created: EXE import returned a desktop device\n", stderr);
+        const auto* path = std::getenv("X2W_SHIM_CHAIN_DIR");
+        if (!path || !*path) fail("X2W_SHIM_CHAIN_DIR is not set");
+        const auto directory = std::filesystem::path(path);
+        request->scene = std::make_unique<MeshShadowDraw>(
+            request->created_device.Get(), (directory / "mesh.dxil").string().c_str(),
+            (directory / "receiver.dxil").string().c_str(), (directory / "caster.dxil").string().c_str(),
+            (directory / "frames.case").string().c_str(), true);
+        if (!request->scene->supported()) return DXGI_ERROR_UNSUPPORTED;
+        return S_OK;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        return E_FAIL;
+    } catch (const Failure&) {
+        return E_FAIL;
+    }
+}
+
+extern "C" __declspec(dllexport) HRESULT shadow_record(void* args, UINT frame, UINT map)
+{
+    try {
+        shadow_request(args)->scene->record(frame, map);
+        std::fprintf(stderr, "shadow record frame=%u map=%u\n", frame, map);
+        return S_OK;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        return E_FAIL;
+    }
+}
+
+extern "C" __declspec(dllexport) HRESULT shadow_submit(void* args, UINT frame)
+{
+    try {
+        const auto fence = shadow_request(args)->scene->submit(frame);
+        if (!fence) {
+            std::fprintf(stderr, "shadow submit frame=%u rejected\n", frame);
+            return E_INVALIDARG;
+        }
+        std::fprintf(stderr, "shadow submit frame=%u fence=%llu\n", frame, static_cast<unsigned long long>(fence));
+        return S_OK;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        return E_FAIL;
+    }
+}
+
+bool shim_shadow_wait(void* args, std::vector<unsigned char>& output)
+{
+    try {
+        const auto fence = shadow_request(args)->scene->wait(output);
+        std::fprintf(stderr, "shadow wait fence=%llu\n", static_cast<unsigned long long>(fence));
+        return true;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        return false;
+    }
+}
+
+extern "C" __declspec(dllexport) HRESULT shadow_close(void* args)
+{
+    try {
+        std::unique_ptr<ShadowRequest> request(shadow_request(args));
+        // An unsupported mesh tier leaves an empty scene with a live device.
+        const UINT surfaces = request->scene && request->scene->supported()
+            ? request->scene->release_surfaces() : 0;
+        request->scene.reset();
+        const bool device = static_cast<bool>(request->created_device);
+        request->created_device.Reset();
+        std::fprintf(stderr, "shadow close surfaces=%u device=%u\n", surfaces, unsigned(device));
+        return S_OK;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        return E_FAIL;
     }
 }

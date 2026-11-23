@@ -1,0 +1,177 @@
+; Source-built subgroup compaction fixture for the SPIR-V bridge.
+;
+; One group of 64 threads computes a sparse predicate from lane identity and a 64-bit input mask,
+; ballots the predicate, derives the first/last active lane and each lane's compaction rank, and
+; writes every intermediate to its own output word. Compaction writes go to a per-wave disjoint
+; range keyed by rank, so the result does not depend on workgroup or wave scheduling order.
+;
+; compaction.py injects the two deterministic input masks and the negative-control mutations by
+; replacing the X2W_MASK_LO, X2W_MASK_HI, X2W_PRED_FLIP and X2W_WRITE_BIAS constants. The masks
+; default to zero so this file assembles on its own.
+;
+; Lane widths 4, 8, 16, 32 and 64 are supported. The CPU reference in compaction.py is computed
+; from the width the shader observed; the mask design keeps ballot word 0 nonzero for every wave
+; at every supported width, which the first-active computation relies on.
+OpCapability Shader
+OpCapability GroupNonUniformBallot
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %out %lane_in %width_in %local_in
+OpExecutionMode %main LocalSize 64 1 1
+OpDecorate %lane_in BuiltIn SubgroupLocalInvocationId
+OpDecorate %width_in BuiltIn SubgroupSize
+OpDecorate %local_in BuiltIn LocalInvocationIndex
+OpDecorate %out DescriptorSet 0
+OpDecorate %out Binding 0
+OpDecorate %rt ArrayStride 4
+OpDecorate %block Block
+OpMemberDecorate %block 0 Offset 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%bool = OpTypeBool
+%uint = OpTypeInt 32 0
+%int = OpTypeInt 32 1
+%vec4 = OpTypeVector %uint 4
+%rt = OpTypeRuntimeArray %uint
+%block = OpTypeStruct %rt
+%sb = OpTypePointer StorageBuffer %block
+%out = OpVariable %sb StorageBuffer
+%ptr = OpTypePointer StorageBuffer %uint
+%in_uint = OpTypePointer Input %uint
+%lane_in = OpVariable %in_uint Input
+%width_in = OpVariable %in_uint Input
+%local_in = OpVariable %in_uint Input
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%c2 = OpConstant %uint 2
+%c3 = OpConstant %uint 3
+%c4 = OpConstant %uint 4
+%c5 = OpConstant %uint 5
+%c31 = OpConstant %uint 31
+%c32 = OpConstant %uint 32
+%c64 = OpConstant %uint 64
+%c65 = OpConstant %uint 65
+%c129 = OpConstant %uint 129
+%c145 = OpConstant %uint 145
+%c161 = OpConstant %uint 161
+%c177 = OpConstant %uint 177
+%c193 = OpConstant %uint 193
+%c257 = OpConstant %uint 257
+%all = OpConstant %uint 0xffffffff
+%payload_base = OpConstant %uint 0x80000000
+%mask_lo = OpConstant %uint 0x00000000 ; X2W_MASK_LO
+%mask_hi = OpConstant %uint 0x00000000 ; X2W_MASK_HI
+%pred_flip = OpConstant %uint 0 ; X2W_PRED_FLIP
+%write_bias = OpConstant %uint 0 ; X2W_WRITE_BIAS
+%scope = OpConstant %uint 3
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%lane = OpLoad %uint %lane_in
+%width = OpLoad %uint %width_in
+%local = OpLoad %uint %local_in
+%wave = OpUDiv %uint %local %width
+%index = OpBitwiseXor %uint %local %pred_flip
+%word_sel = OpShiftRightLogical %uint %index %c5
+%is_hi = OpINotEqual %bool %word_sel %zero
+%word = OpSelect %uint %is_hi %mask_hi %mask_lo
+%bit_index = OpBitwiseAnd %uint %index %c31
+%shifted = OpShiftRightLogical %uint %word %bit_index
+%low = OpBitwiseAnd %uint %shifted %one
+%pred = OpINotEqual %bool %low %zero
+%ballot = OpGroupNonUniformBallot %vec4 %scope %pred
+%b0 = OpCompositeExtract %uint %ballot 0
+%b1 = OpCompositeExtract %uint %ballot 1
+%b2 = OpCompositeExtract %uint %ballot 2
+%b3 = OpCompositeExtract %uint %ballot 3
+%lane_dst = OpAccessChain %ptr %out %zero %local
+OpStore %lane_dst %lane
+%count0 = OpBitCount %uint %b0
+%count1 = OpBitCount %uint %b1
+%count2 = OpBitCount %uint %b2
+%count3 = OpBitCount %uint %b3
+%count01 = OpIAdd %uint %count0 %count1
+%count23 = OpIAdd %uint %count2 %count3
+%count = OpIAdd %uint %count01 %count23
+%neg_b0 = OpISub %uint %zero %b0
+%low_bit = OpBitwiseAnd %uint %b0 %neg_b0
+%low_minus = OpISub %uint %low_bit %one
+%first = OpBitCount %uint %low_minus
+%lane_word = OpShiftRightLogical %uint %lane %c5
+%lane_bit = OpBitwiseAnd %uint %lane %c31
+%one_shifted = OpShiftLeftLogical %uint %one %lane_bit
+%below = OpISub %uint %one_shifted %one
+%lane_word0 = OpIEqual %bool %lane_word %zero
+%keep0 = OpSelect %uint %lane_word0 %below %all
+%keep1 = OpSelect %uint %lane_word0 %zero %below
+%rank0_and = OpBitwiseAnd %uint %b0 %keep0
+%rank1_and = OpBitwiseAnd %uint %b1 %keep1
+%rank0_count = OpBitCount %uint %rank0_and
+%rank1_count = OpBitCount %uint %rank1_and
+%rank = OpIAdd %uint %rank0_count %rank1_count
+; Selected lane is the highest active lane of the wave; its compaction rank is count - 1.
+%selected_rank = OpISub %uint %count %one
+; Last active lane, most significant set bit across the two used ballot words.
+%has_hi = OpINotEqual %bool %b1 %zero
+%msb0 = OpExtInst %int %glsl FindUMsb %b0
+%msb1 = OpExtInst %int %glsl FindUMsb %b1
+%msb1_word = OpIAdd %int %msb1 %c32
+%last_int = OpSelect %int %has_hi %msb1_word %msb0
+%last = OpBitcast %uint %last_int
+; Compaction: each active lane writes its identity at a wave-disjoint range keyed by rank.
+%compact_base = OpIMul %uint %wave %width
+%compact_offset = OpIAdd %uint %compact_base %rank
+%compact_offset_biased = OpIAdd %uint %compact_offset %write_bias
+%compact_index = OpIAdd %uint %compact_offset_biased %c257
+%payload = OpBitwiseOr %uint %local %payload_base
+; Exactly one thread writes the shared width word.
+%is_local0 = OpIEqual %bool %local %zero
+OpSelectionMerge %after_width None
+OpBranchConditional %is_local0 %write_width %after_width
+%write_width = OpLabel
+%width_dst = OpAccessChain %ptr %out %zero %c64
+OpStore %width_dst %width
+OpBranch %after_width
+%after_width = OpLabel
+%is_lane0 = OpIEqual %bool %lane %zero
+OpSelectionMerge %after_sections None
+OpBranchConditional %is_lane0 %write_sections %after_sections
+%write_sections = OpLabel
+%ballot_index = OpIMul %uint %wave %c4
+%ballot_index0 = OpIAdd %uint %ballot_index %c65
+%ballot_dst0 = OpAccessChain %ptr %out %zero %ballot_index0
+OpStore %ballot_dst0 %b0
+%ballot_index1 = OpIAdd %uint %ballot_index0 %one
+%ballot_dst1 = OpAccessChain %ptr %out %zero %ballot_index1
+OpStore %ballot_dst1 %b1
+%ballot_index2 = OpIAdd %uint %ballot_index0 %c2
+%ballot_dst2 = OpAccessChain %ptr %out %zero %ballot_index2
+OpStore %ballot_dst2 %b2
+%ballot_index3 = OpIAdd %uint %ballot_index2 %one
+%ballot_dst3 = OpAccessChain %ptr %out %zero %ballot_index3
+OpStore %ballot_dst3 %b3
+%first_index = OpIAdd %uint %wave %c129
+%first_dst = OpAccessChain %ptr %out %zero %first_index
+OpStore %first_dst %first
+%count_index = OpIAdd %uint %wave %c145
+%count_dst = OpAccessChain %ptr %out %zero %count_index
+OpStore %count_dst %count
+%last_index = OpIAdd %uint %wave %c161
+%last_dst = OpAccessChain %ptr %out %zero %last_index
+OpStore %last_dst %last
+%selected_index = OpIAdd %uint %wave %c177
+%selected_dst = OpAccessChain %ptr %out %zero %selected_index
+OpStore %selected_dst %selected_rank
+OpBranch %after_sections
+%after_sections = OpLabel
+%rank_dst_index = OpIAdd %uint %local %c193
+%rank_dst = OpAccessChain %ptr %out %zero %rank_dst_index
+OpStore %rank_dst %rank
+OpSelectionMerge %done None
+OpBranchConditional %pred %write_compact %done
+%write_compact = OpLabel
+%compact_dst = OpAccessChain %ptr %out %zero %compact_index
+OpStore %compact_dst %payload
+OpBranch %done
+%done = OpLabel
+OpReturn
+OpFunctionEnd

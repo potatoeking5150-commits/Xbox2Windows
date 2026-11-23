@@ -8,8 +8,9 @@
 //
 // Built with the static MSVC runtime like the life_* fixtures; the callback
 // is registered through .CRT$XLB so the linker emits a real TLS directory
-// with data. pe_map rejects non-empty TLS templates (MAP_UNSUPPORTED
-// "TLS data"); this fixture pins that difference. See Refs #165.
+// with data. pe_map serves the template through a carrier DLL that Windows
+// loads (tools/pe_map.cpp), so both loaders must report the same values.
+// See Refs #165.
 #include <windows.h>
 
 #include <cstdint>

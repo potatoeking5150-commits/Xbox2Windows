@@ -1,5 +1,6 @@
 #include "dxr_fixture.h"
 #include "ray_candidates.h"
+#include "ray_candidates_pipeline.h"
 #include "ray_pipeline.h"
 #include "ray_query.h"
 #include <algorithm>
@@ -63,25 +64,51 @@ struct RayPipeline {
     D3D12_DISPATCH_RAYS_DESC dispatch{};
 };
 
-static RayPipeline make_ray_pipeline(ID3D12Device5* device, ID3D12RootSignature* root, UINT rayCount)
+static RayPipeline make_ray_pipeline(ID3D12Device5* device, ID3D12RootSignature* root,
+                                     UINT rayCount, UINT opacityGeometries)
 {
-    const D3D12_DXIL_LIBRARY_DESC library{{ray_pipeline, sizeof(ray_pipeline)}, 0, nullptr};
+    const D3D12_SHADER_BYTECODE bytecode = opacityGeometries
+        ? D3D12_SHADER_BYTECODE{ray_candidates_pipeline, sizeof(ray_candidates_pipeline)}
+        : D3D12_SHADER_BYTECODE{ray_pipeline, sizeof(ray_pipeline)};
+    const D3D12_DXIL_LIBRARY_DESC library{bytecode, 0, nullptr};
+    LPCWSTR hitGroupName = L"TriangleHitGroup";
     D3D12_HIT_GROUP_DESC hitGroup{};
-    hitGroup.HitGroupExport = L"TriangleHitGroup";
+    hitGroup.HitGroupExport = hitGroupName;
     hitGroup.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
     hitGroup.ClosestHitShaderImport = L"ClosestHit";
+    ComPtr<ID3D12RootSignature> hitRoot;
+    if (opacityGeometries) {
+        hitGroup.AnyHitShaderImport = L"AnyHit";
+        D3D12_ROOT_PARAMETER geometryIndex{};
+        geometryIndex.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        geometryIndex.Constants = {0, 0, 1};
+        const D3D12_ROOT_SIGNATURE_DESC layout{1, &geometryIndex, 0, nullptr,
+                                               D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE};
+        ComPtr<ID3DBlob> blob;
+        check(D3D12SerializeRootSignature(&layout, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr),
+              "Serialize DXR hit group root");
+        check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&hitRoot)),
+              "Create DXR hit group root");
+    }
     const D3D12_RAYTRACING_SHADER_CONFIG shaderConfig{sizeof(bvh_fixture::Row), 2 * sizeof(float)};
     const D3D12_GLOBAL_ROOT_SIGNATURE globalRoot{root};
     const D3D12_RAYTRACING_PIPELINE_CONFIG pipelineConfig{1};
+    const D3D12_LOCAL_ROOT_SIGNATURE localRoot{hitRoot.Get()};
+    D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION hitRootAssociation{};
     const D3D12_STATE_SUBOBJECT subobjects[]{
         {D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &library},
         {D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hitGroup},
         {D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &shaderConfig},
         {D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &globalRoot},
         {D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pipelineConfig},
+        {D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &localRoot},
+        {D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &hitRootAssociation},
     };
+    const UINT commonSubobjectCount = static_cast<UINT>(std::size(subobjects)) - 2;
+    hitRootAssociation = {&subobjects[commonSubobjectCount], 1, &hitGroupName};
+    const UINT subobjectCount = opacityGeometries ? static_cast<UINT>(std::size(subobjects)) : commonSubobjectCount;
     const D3D12_STATE_OBJECT_DESC desc{D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
-        static_cast<UINT>(std::size(subobjects)), subobjects};
+        subobjectCount, subobjects};
     RayPipeline pipeline;
     check(device->CreateStateObject(&desc, IID_PPV_ARGS(&pipeline.state)), "Create DXR ray pipeline");
 
@@ -89,19 +116,29 @@ static RayPipeline make_ray_pipeline(ID3D12Device5* device, ID3D12RootSignature*
     check(pipeline.state.As(&properties), "Get DXR state object properties");
     constexpr UINT tableAlignment = D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT;
     constexpr UINT identifierSize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
-    constexpr const wchar_t* exports[]{L"RayGen", L"Miss", L"TriangleHitGroup"};
-    // One identifier per table, with padding between tables for 64-byte starts.
-    std::vector<std::array<BYTE, tableAlignment>> records(std::size(exports));
-    for (size_t i = 0; i < records.size(); ++i) {
-        const void* identifier = properties->GetShaderIdentifier(exports[i]);
+    const UINT hitCount = (std::max)(1u, opacityGeometries);
+    std::vector<std::array<BYTE, tableAlignment>> records(2 + hitCount);
+    const auto writeIdentifier = [&](auto& record, LPCWSTR name) {
+        const void* identifier = properties->GetShaderIdentifier(name);
         if (!identifier) throw std::runtime_error("Missing DXR shader identifier");
-        std::memcpy(records[i].data(), identifier, identifierSize);
+        std::memcpy(record.data(), identifier, identifierSize);
+    };
+    writeIdentifier(records[0], L"RayGen");
+    writeIdentifier(records[1], L"Miss");
+    // TraceRay uses multiplier 1 and all instances use offset 0, so
+    // each geometry selects its own record with one DWORD of local data.
+    static_assert(identifierSize + sizeof(UINT) <= tableAlignment);
+    for (UINT g = 0; g < hitCount; ++g) {
+        auto& record = records[2 + g];
+        writeIdentifier(record, hitGroupName);
+        if (opacityGeometries) std::memcpy(record.data() + identifierSize, &g, sizeof(g));
     }
     pipeline.shaderTable = bvh_fixture::upload(device, records);
     const auto base = pipeline.shaderTable->GetGPUVirtualAddress();
     pipeline.dispatch.RayGenerationShaderRecord = {base, identifierSize};
     pipeline.dispatch.MissShaderTable = {base + tableAlignment, identifierSize, identifierSize};
-    pipeline.dispatch.HitGroupTable = {base + 2 * tableAlignment, identifierSize, identifierSize};
+    const UINT hitStride = opacityGeometries ? tableAlignment : identifierSize;
+    pipeline.dispatch.HitGroupTable = {base + 2 * tableAlignment, hitCount * hitStride, hitStride};
     pipeline.dispatch.Width = rayCount;
     pipeline.dispatch.Height = pipeline.dispatch.Depth = 1;
     return pipeline;
@@ -112,14 +149,29 @@ std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Ver
     Backend backend, const SceneUpdate* update, const std::vector<D3D12_RAYTRACING_GEOMETRY_FLAGS>* triangleGeometries) {
     const bool usePipeline = backend == Backend::pipeline;
     if (usePipeline) {
-        if (update || triangleGeometries)
-            throw std::runtime_error("The DXR pipeline fixture requires a static, opaque scene");
-        if (std::any_of(instances.begin(), instances.end(), [](const auto& desc) {
+        if (triangleGeometries && (triangleGeometries->empty() || triangleGeometries->size() > 4))
+            throw std::runtime_error("The DXR opacity pipeline requires one to four geometries");
+        const auto usesHitGroupOffset = [](const auto& descriptors) {
+            return std::any_of(descriptors.begin(), descriptors.end(), [](const auto& desc) {
                 return desc.InstanceContributionToHitGroupIndex != 0;
+            });
+        };
+        if (usesHitGroupOffset(instances) || (update && usesHitGroupOffset(update->instances)))
+            throw std::runtime_error("The DXR pipeline fixture requires instance hit-group offset 0");
+        if (std::any_of(rays.begin(), rays.end(), [triangleGeometries](const Ray& ray) {
+                if (triangleGeometries) {
+                    constexpr UINT opacityFlags = D3D12_RAY_FLAG_FORCE_OPAQUE | D3D12_RAY_FLAG_FORCE_NON_OPAQUE |
+                                                  D3D12_RAY_FLAG_CULL_OPAQUE | D3D12_RAY_FLAG_CULL_NON_OPAQUE;
+                    constexpr UINT allowed = opacityFlags | D3D12_RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | 0xf0000u;
+                    const UINT opacity = ray.flags & opacityFlags;
+                    return (ray.flags & ~allowed) != 0 || (opacity & (opacity - 1)) != 0;
+                }
+                constexpr UINT cullFlags = D3D12_RAY_FLAG_CULL_FRONT_FACING_TRIANGLES |
+                                           D3D12_RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+                return (ray.flags & ~(report_facing | cullFlags)) != 0 ||
+                       (ray.flags & cullFlags) == cullFlags;
             }))
-            throw std::runtime_error("The DXR pipeline fixture has only hit group 0");
-        if (std::any_of(rays.begin(), rays.end(), [](const Ray& ray) { return ray.flags != 0; }))
-            throw std::runtime_error("The DXR pipeline fixture requires unflagged rays");
+            throw std::runtime_error("Unsupported flags for the selected DXR pipeline fixture");
     }
     std::puts(usePipeline ? "dxr_backend=dispatch_rays" : "dxr_backend=inline_ray_query");
     ComPtr<ID3D12Device5> dxr;
@@ -183,14 +235,15 @@ std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Ver
     const D3D12_SHADER_BYTECODE shader = triangleGeometries
         ? D3D12_SHADER_BYTECODE{ray_candidates, sizeof(ray_candidates)} : D3D12_SHADER_BYTECODE{ray_query, sizeof(ray_query)};
     ComPtr<ID3D12RootSignature> root;
-    // Both opaque backends share the root signature embedded in ray_query.
+    // Both backends share the global root signature embedded in the compute shader.
     check(device->CreateRootSignature(0, shader.pShaderBytecode, shader.BytecodeLength, IID_PPV_ARGS(&root)),
           "Create DXR fixture root");
     const auto rayCount = static_cast<UINT>(rays.size());
     RayPipeline rayPipeline;
     ComPtr<ID3D12PipelineState> compute;
     if (usePipeline) {
-        rayPipeline = make_ray_pipeline(dxr.Get(), root.Get(), rayCount);
+        const UINT opacityGeometries = triangleGeometries ? static_cast<UINT>(geometries.size()) : 0;
+        rayPipeline = make_ray_pipeline(dxr.Get(), root.Get(), rayCount, opacityGeometries);
     } else {
         D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
         pso.pRootSignature = root.Get();
@@ -218,7 +271,9 @@ std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Ver
         updatedInstances = bvh_fixture::upload(device, descriptors);
         geometries[0].Triangles.VertexBuffer.StartAddress = updatedVertices->GetGPUVirtualAddress();
         top.Inputs.InstanceDescs = updatedInstances->GetGPUVirtualAddress();
-        bottom.Inputs.Flags = top.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+        // Keep ALLOW_UPDATE on the refit. Dropping it caused device removal on the GTX 1060.
+        bottom.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+        top.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
         bottom.SourceAccelerationStructureData = bottom.DestAccelerationStructureData;
         top.SourceAccelerationStructureData = top.DestAccelerationStructureData;
         list->ResourceBarrier(1, &order);
@@ -272,9 +327,10 @@ bool check_dxr_rays(ID3D12Device* device, bool usePipeline) {
     return true;
 }
 
-bool check_dxr_update(ID3D12Device* device) {
+bool check_dxr_update(ID3D12Device* device, bool usePipeline) {
     using namespace dxr_fixture;
-    if (!supported(device)) return false;
+    const auto backend = usePipeline ? Backend::pipeline : Backend::inline_query;
+    if (!supported(device, backend)) return false;
     const std::vector<Vertex> initial{{-1,-1,1}, {1,-1,1}, {0,1,1}};
     const std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances{instance(7,1), instance(11,2,4)};
     const SceneUpdate update{{{-1,-1,3}, {1,-1,3}, {0,1,3}}, {instance(7,1,2), instance(11,4,-3)}};
@@ -284,10 +340,16 @@ bool check_dxr_update(ID3D12Device* device) {
     for (const auto& probe : probes)
         rays.push_back({probe.x,0,0,0.01f,0,0,1,8,probe.mask});
     rays.push_back({2,0,0,0.01f,0,0,1,2,1});
-    const auto before = trace(device, initial, instances, rays);
-    const auto after = trace(device, initial, instances, rays, Backend::inline_query, &update);
-    if (after != trace(device, update.vertices, update.instances, rays))
+    const auto before = trace(device, initial, instances, rays, backend);
+    const auto after = trace(device, initial, instances, rays, backend, &update);
+    const auto rebuilt = trace(device, update.vertices, update.instances, rays, backend);
+    const auto mismatch = std::mismatch(after.begin(), after.end(), rebuilt.begin());
+    if (mismatch.first != after.end()) {
+        const auto word = static_cast<UINT>(mismatch.first - after.begin());
+        std::fprintf(stderr, "ray=%u field=%u rebuilt=%08x updated=%08x\n",
+                     word / 4, word % 4, *mismatch.second, *mismatch.first);
         throw std::runtime_error("In-place update differs from a fresh DXR build");
+    }
     const UINT idsBefore[]{7,11,0,0,0,0,0}, idsAfter[]{0,0,7,11,0,0,0};
     for (UINT i = 0; i < rays.size(); ++i) {
         for (bool updated : {false, true}) {
@@ -307,6 +369,24 @@ bool check_dxr_update(ID3D12Device* device) {
             }
         }
     }
+    const auto checkStale = [&](const char* name, const std::vector<bvh_fixture::Word>& stale, UINT expectedMask) {
+        UINT mismatchMask = 0;
+        for (UINT i = 0; i < rays.size(); ++i) {
+            const auto row = stale.begin() + 4 * i;
+            if (!std::equal(row, row + 4, after.begin() + 4 * i))
+                mismatchMask |= 1u << i;
+        }
+        std::printf("dxr_update control=%s mismatch_ray_mask=0x%02x expected=0x%02x\n",
+                    name, mismatchMask, expectedMask);
+        if (mismatchMask != expectedMask)
+            throw std::runtime_error("DXR update stale-result control differs from expected rays");
+    };
+    // Build valid controls with old inputs. Tracing an old TLAS after changing its BLAS is invalid.
+    checkStale("stale_scene", before, 0x0f); // Rays 0-3 change hit status.
+    checkStale("stale_vertices", trace(device, initial, update.instances, rays, backend),
+               0x4c); // Rays 2 and 3 change distance, and ray 6 hits before clipping.
+    checkStale("stale_instances", trace(device, update.vertices, instances, rays, backend),
+               0x0f); // Rays 0-3 change hit status.
     std::puts("dxr_update rays=7 changed_hits=4 in_place_matches_rebuild=1");
     return true;
 }

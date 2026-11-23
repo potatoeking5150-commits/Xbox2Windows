@@ -11,6 +11,9 @@ from exe_entry_check import Observation, check
 from mapped_exe_chain_check import run_mapped
 from native_map_check import Mapper, STATUS
 
+FIRST_RECORD = bytes.fromhex("08 00 04 82 24 25 8f 80 7f")
+SECOND_RECORD = bytes.fromhex("08 00 04 84 24 25 8f 80 7f")
+
 
 def wider_exit_control(native):
     # The startup consumes AL. Replace its zero-extension with MOV ECX,EAX
@@ -122,8 +125,7 @@ def window_record(copies):
 
 def compare(mapper, native, lifted, codec, *blast_images):
     wider_exit_control(native)
-    first = bytes.fromhex("08 00 04 82 24 25 8f 80 7f")
-    second = bytes.fromhex("08 00 04 84 24 25 8f 80 7f")
+    first, second = FIRST_RECORD, SECOND_RECORD
     full = ["alloc 8", "input 8", "output 13", "free"]
     partial = ["alloc 8", "input 4", "input 0", "output 1", "free"]
     cases = [

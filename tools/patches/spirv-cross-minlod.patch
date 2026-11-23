@@ -1,0 +1,43 @@
+SPIRV-Cross 57e4efcc84112abcd426dc5ec248b5339bee04f2 (Apache-2.0)
+https://github.com/KhronosGroup/SPIRV-Cross/blob/57e4efcc84112abcd426dc5ec248b5339bee04f2/LICENSE
+
+--- a/spirv_hlsl.cpp
++++ b/spirv_hlsl.cpp
+@@ -3948,8 +3948,18 @@
+ 	string expr;
+ 	string texop;
+ 
+-	if (minlod != 0)
+-		SPIRV_CROSS_THROW("MinLod texture operand not supported in HLSL.");
++	if (minlod)
++	{
++		bool ordinary_sample = op == OpImageSampleImplicitLod ||
++		                       (op == OpImageSampleExplicitLod && grad_x && grad_y);
++		bool comparison_sample = op == OpImageSampleDrefImplicitLod && !bias;
++		bool supported_dimension = imgtype.image.dim == Dim1D || imgtype.image.dim == Dim2D ||
++		                           imgtype.image.dim == Dim3D || imgtype.image.dim == DimCube;
++		if (hlsl_options.shader_model < 50 || !(ordinary_sample || comparison_sample) ||
++		    !supported_dimension || lod || (imgtype.image.dim == DimCube && (offset || coffset)) ||
++		    (ordinary_sample && is_depth_image(imgtype, img)))
++			SPIRV_CROSS_THROW("MinLod texture operand not supported for this HLSL sample.");
++	}
+ 
+ 	if (op == OpImageFetch)
+ 	{
+@@ -4223,6 +4233,16 @@
+ 		forward = forward && should_forward(offset);
+ 		expr += ", ";
+ 		expr += to_expression(offset);
++	}
++
++	if (minlod)
++	{
++		// The clamp follows the optional texel offset. Cube textures have no offset operand.
++		if (!coffset && !offset && imgtype.image.dim != DimCube)
++			expr += ", 0";
++		forward = forward && should_forward(minlod);
++		expr += ", ";
++		expr += to_expression(minlod);
+ 	}
+ 
+ 	if (sample)

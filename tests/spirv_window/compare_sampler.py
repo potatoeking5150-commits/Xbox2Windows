@@ -103,7 +103,7 @@ def emit(directory, assembler, validator, cross):
         subprocess.run([assembler, "--target-env", "vulkan1.2", text, "-o", module], check=True)
         subprocess.run([validator, "--target-env", "vulkan1.2", module], check=True)
         hlsl = directory / f"{name}.hlsl"
-        subprocess.run([cross, module, "--hlsl", "--shader-model", "66", "--output", hlsl], check=True)
+        subprocess.run([cross, module, "--hlsl", "--shader-model", "60", "--output", hlsl], check=True)
         outputs[name] = hlsl
     source = outputs["lowered"].read_text(encoding="utf-8")
     comparison = re.search(r"SamplerComparisonState\s+(\w+)\s*:\s*register\(s2\b", source)
@@ -118,13 +118,13 @@ def emit(directory, assembler, validator, cross):
 
 def compile_dxil(directory, dxc, outputs):
     # The unsplit module reproduces the original DXC rejection.
-    shared = subprocess.run([dxc, "-T", "cs_6_6", "-E", "main", "-Fo", directory / "shared.dxil", outputs["shared"]],
+    shared = subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", directory / "shared.dxil", outputs["shared"]],
                             capture_output=True, text=True)
     if shared.returncode == 0 or "no matching member function for call to 'SampleLevel'" not in shared.stderr:
         raise AssertionError(f"Expected the shared-sampler DXC diagnostic\n{shared.stdout}\n{shared.stderr}")
     print("shared-sampler HLSL: DXC rejected SampleLevel as expected", flush=True)
     dxil = directory / "lowered.dxil"
-    subprocess.run([dxc, "-T", "cs_6_6", "-E", "main", "-Fo", dxil, outputs["lowered"]], check=True)
+    subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", dxil, outputs["lowered"]], check=True)
     return dxil
 
 

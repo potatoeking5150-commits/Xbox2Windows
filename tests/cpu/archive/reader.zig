@@ -6,6 +6,10 @@ extern "archive_codec" fn release(record: *anyopaque) callconv(.C) void;
 extern "archive_codec" fn completed(count: c_uint) callconv(.C) void;
 
 pub fn main() u8 {
+    return readRecords(publish);
+}
+
+pub fn readRecords(comptime publishRecord: anytype) u8 {
     var count: u32 = 0;
     var status: u8 = 0;
     while (true) {
@@ -20,7 +24,7 @@ pub fn main() u8 {
             status = 2;
             break;
         }
-        if (publish(record) != 0) {
+        if (publishRecord(record) != 0) {
             status = 4;
             break;
         }

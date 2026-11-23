@@ -16,12 +16,14 @@ $revisions = [ordered]@{
     'SPIRV-Cross'   = '57e4efcc84112abcd426dc5ec248b5339bee04f2'
 }
 $tools = 'spirv-as.exe', 'spirv-val.exe', 'spirv-cross.exe'
+$crossPatch = Join-Path $PSScriptRoot 'patches/spirv-cross-minlod.patch'
 
 New-Item -ItemType Directory -Force -Path $Destination | Out-Null
 $Destination = (Resolve-Path -LiteralPath $Destination).Path
 $bin = Join-Path $Destination 'bin'
 $stamp = Join-Path $bin 'revisions.txt'
 $expected = ($revisions.GetEnumerator() | ForEach-Object { "$($_.Key) $($_.Value)" }) -join "`n"
+$expected += "`nSPIRV-Cross MinLod $((Get-FileHash -LiteralPath $crossPatch).Hash)"
 $built = (Test-Path -LiteralPath $stamp) -and
     ((Get-Content -Raw -LiteralPath $stamp).Trim() -eq $expected) -and
     -not ($tools | Where-Object { -not (Test-Path -LiteralPath (Join-Path $bin $_)) })
@@ -43,6 +45,9 @@ if ($built) {
         $head = git -C $dir rev-parse HEAD
         if ($head -ne $entry.Value) { throw "$($entry.Key) is at $head, expected $($entry.Value)." }
     }
+
+    git -C (Join-Path $src 'SPIRV-Cross') apply -- $crossPatch
+    if ($LASTEXITCODE -ne 0) { throw 'Applying the SPIRV-Cross MinLod patch failed.' }
 
     # Static CRT, so the cached binaries do not depend on the runner's redistributable.
     $common = @('-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_POLICY_DEFAULT_CMP0091=NEW',

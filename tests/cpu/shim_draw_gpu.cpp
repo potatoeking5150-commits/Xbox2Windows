@@ -25,56 +25,22 @@
 #include "triangle_vs_flip.h"
 #include "triangle_ps_flip.h"
 
+#include "shim_gpu_device.h"
+
 namespace {
 using Microsoft::WRL::ComPtr;
 
 constexpr UINT side = 64;
 enum class TextureStep { none, initialize, update, stale, reuse };
 
-void require(HRESULT hr, const char* operation)
+inline void require(HRESULT hr, const char* operation)
 {
-    if (FAILED(hr)) {
-        std::fprintf(stderr, "%s failed (HRESULT 0x%08lx)\n", operation, static_cast<unsigned long>(hr));
-        throw hr;
-    }
+    shim_require(hr, operation);
 }
 
-ComPtr<ID3D12Device> create_device()
+inline ComPtr<ID3D12Device> create_device()
 {
-    ComPtr<IDXGIFactory6> factory;
-    require(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
-    ComPtr<IDXGIAdapter1> adapter;
-    char backend[16]{};
-    const auto size = GetEnvironmentVariableA("X2W_SHIM_DRAW_ADAPTER", backend, sizeof(backend));
-    if (!size || (size < sizeof(backend) && std::strcmp(backend, "warp") == 0)) {
-        require(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)), "EnumWarpAdapter");
-    } else if (size < sizeof(backend) && std::strcmp(backend, "hardware") == 0) {
-        for (UINT i = 0;; ++i) {
-            const HRESULT hr = factory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-                                                                   IID_PPV_ARGS(&adapter));
-            if (hr == DXGI_ERROR_NOT_FOUND) {
-                std::fputs("no D3D12 physical adapter\n", stderr);
-                ExitProcess(77);
-            }
-            require(hr, "EnumAdapterByGpuPreference");
-            DXGI_ADAPTER_DESC1 desc{};
-            require(adapter->GetDesc1(&desc), "GetDesc1");
-            if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
-                const HRESULT support = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0,
-                                                          __uuidof(ID3D12Device), nullptr);
-                if (support != DXGI_ERROR_UNSUPPORTED) {
-                    require(support, "Probe physical device");
-                    break;
-                }
-            }
-            adapter.Reset();
-        }
-    } else {
-        require(E_INVALIDARG, "Select draw adapter");
-    }
-    ComPtr<ID3D12Device> device;
-    require(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice");
-    return device;
+    return shim_create_device();
 }
 class DrawSession {
 public:

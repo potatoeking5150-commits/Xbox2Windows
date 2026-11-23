@@ -16,6 +16,12 @@ Supported AVX2 instructions (all 28 forms from docs/coverage/x64_zen2.tsv group 
     vpgatherdd, vpgatherdq, vpgatherqd, vpgatherqq
   - Masked loads and stores: vpmaskmovd, vpmaskmovq
 
+Supported FMA3 instructions (all 60 forms from docs/coverage/x64_zen2.tsv group FMA):
+  - Scalar single/double (XMM, reg or m32/m64 op2): vfmadd/vfmsub/vfnmadd/vfnmsub
+    x {132, 213, 231} x {ss, sd}
+  - Packed single/double (XMM/YMM, reg or m128/m256 op2): vfmadd/vfmsub/vfnmadd/
+    vfnmsub/vfmaddsub/vfmsubadd x {132, 213, 231} x {ps, pd}
+
 Transport/ABI glue: vmovdqu (128/256-bit flat load, store and register copy),
 vzeroupper and terminal ret.
 
@@ -80,6 +86,32 @@ MASKMOV_SPECS = {
     Code.VEX_VPMASKMOVQ_M256_YMM_YMM: (True, 64, True),
 }
 
+# (kind: "ss"|"sd"|"ps"|"pd", order: 132|213|231, mode: 0..5, is_ymm: bool)
+# mode: 0=madd, 1=msub, 2=nmadd, 3=nmsub, 4=maddsub, 5=msubadd
+def _build_fma3_specs():
+    specs = {}
+    families = (
+        ("VFMADD", 0, True),
+        ("VFMSUB", 1, True),
+        ("VFNMADD", 2, True),
+        ("VFNMSUB", 3, True),
+        ("VFMADDSUB", 4, False),
+        ("VFMSUBADD", 5, False),
+    )
+    for fam, mode, has_scalar in families:
+        for order in (132, 213, 231):
+            specs[getattr(Code, f"VEX_{fam}{order}PS_XMM_XMM_XMMM128")] = ("ps", order, mode, False)
+            specs[getattr(Code, f"VEX_{fam}{order}PS_YMM_YMM_YMMM256")] = ("ps", order, mode, True)
+            specs[getattr(Code, f"VEX_{fam}{order}PD_XMM_XMM_XMMM128")] = ("pd", order, mode, False)
+            specs[getattr(Code, f"VEX_{fam}{order}PD_YMM_YMM_YMMM256")] = ("pd", order, mode, True)
+            if has_scalar:
+                specs[getattr(Code, f"VEX_{fam}{order}SS_XMM_XMM_XMMM32")] = ("ss", order, mode, False)
+                specs[getattr(Code, f"VEX_{fam}{order}SD_XMM_XMM_XMMM64")] = ("sd", order, mode, False)
+    return specs
+
+
+FMA3_SPECS = _build_fma3_specs()
+
 ALLOWED_CODES = {
     Code.VEX_VMOVDQU_XMM_XMMM128,
     Code.VEX_VMOVDQU_XMMM128_XMM,
@@ -117,6 +149,7 @@ ALLOWED_CODES = {
     Code.VEX_VPSRLVQ_YMM_YMM_YMMM256,
     *GATHER_SPECS,
     *MASKMOV_SPECS,
+    *FMA3_SPECS,
 }
 
 BROADCAST_HELPERS = {
@@ -134,7 +167,8 @@ SHIFT_HELPERS = {
     M.VPSRLVQ: "op_vpsrlvq",
 }
 
-PRELUDE = """#include <cstdint>
+PRELUDE = """#include <cmath>
+#include <cstdint>
 #include <cstring>
 
 using word = std::uint64_t;
@@ -446,6 +480,129 @@ static void op_vpmaskmovq_store(word address, const Vec256& mask, const Vec256& 
         }
     }
 }
+
+static Vec256 load_vec32(word address) {
+    Vec256 v{};
+    v.q[0] = static_cast<std::uint64_t>(load32(address));
+    return v;
+}
+
+static Vec256 load_vec64(word address) {
+    Vec256 v{};
+    v.q[0] = load64(address);
+    return v;
+}
+
+static float f32_from_bits(std::uint32_t bits) {
+    float f = 0.0f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+static std::uint32_t f32_to_bits(float f) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &f, 4);
+    return bits;
+}
+
+static double f64_from_bits(std::uint64_t bits) {
+    double d = 0.0;
+    std::memcpy(&d, &bits, 8);
+    return d;
+}
+
+static std::uint64_t f64_to_bits(double d) {
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &d, 8);
+    return bits;
+}
+
+static std::uint32_t fma_lane_f32(std::uint32_t op0_b, std::uint32_t op1_b, std::uint32_t op2_b,
+                                  unsigned order, bool neg_prod, bool neg_add) {
+    const std::uint32_t a_b = (order == 132u) ? op0_b : op1_b;
+    const std::uint32_t b_b = (order == 213u) ? op0_b : op2_b;
+    const std::uint32_t c_b = (order == 132u) ? op1_b : ((order == 213u) ? op2_b : op0_b);
+    const std::uint32_t ops[3] = {a_b, b_b, c_b};
+    for (std::uint32_t b : ops) {
+        if ((b & 0x7fffffffu) > 0x7f800000u) return b | 0x00400000u;
+    }
+    const float a = f32_from_bits(neg_prod ? (a_b ^ 0x80000000u) : a_b);
+    const float b = f32_from_bits(b_b);
+    const float c = f32_from_bits(neg_add ? (c_b ^ 0x80000000u) : c_b);
+    const float r = std::fmaf(a, b, c);
+    if (std::isnan(r)) return 0xffc00000u;
+    return f32_to_bits(r);
+}
+
+static std::uint64_t fma_lane_f64(std::uint64_t op0_b, std::uint64_t op1_b, std::uint64_t op2_b,
+                                  unsigned order, bool neg_prod, bool neg_add) {
+    const std::uint64_t a_b = (order == 132u) ? op0_b : op1_b;
+    const std::uint64_t b_b = (order == 213u) ? op0_b : op2_b;
+    const std::uint64_t c_b = (order == 132u) ? op1_b : ((order == 213u) ? op2_b : op0_b);
+    const std::uint64_t ops[3] = {a_b, b_b, c_b};
+    for (std::uint64_t b : ops) {
+        if ((b & 0x7fffffffffffffffull) > 0x7ff0000000000000ull) return b | 0x0008000000000000ull;
+    }
+    const double a = f64_from_bits(neg_prod ? (a_b ^ 0x8000000000000000ull) : a_b);
+    const double b = f64_from_bits(b_b);
+    const double c = f64_from_bits(neg_add ? (c_b ^ 0x8000000000000000ull) : c_b);
+    const double r = std::fma(a, b, c);
+    if (std::isnan(r)) return 0xfff8000000000000ull;
+    return f64_to_bits(r);
+}
+
+static void fma_lane_signs(unsigned mode, unsigned lane, bool& neg_prod, bool& neg_add) {
+    neg_prod = (mode == 2u || mode == 3u);
+    if (mode == 4u) {
+        neg_add = ((lane & 1u) == 0u);
+    } else if (mode == 5u) {
+        neg_add = ((lane & 1u) != 0u);
+    } else {
+        neg_add = (mode == 1u || mode == 3u);
+    }
+}
+
+static Vec256 op_fma_ss(const Vec256& op0, const Vec256& op1, const Vec256& op2,
+                        unsigned order, unsigned mode) {
+    Vec256 out = copy128(op0);
+    bool neg_prod = false, neg_add = false;
+    fma_lane_signs(mode, 0u, neg_prod, neg_add);
+    set_lane32(out, 0u, fma_lane_f32(lane32(op0, 0u), lane32(op1, 0u), lane32(op2, 0u), order, neg_prod, neg_add));
+    return out;
+}
+
+static Vec256 op_fma_sd(const Vec256& op0, const Vec256& op1, const Vec256& op2,
+                        unsigned order, unsigned mode) {
+    Vec256 out = copy128(op0);
+    bool neg_prod = false, neg_add = false;
+    fma_lane_signs(mode, 0u, neg_prod, neg_add);
+    out.q[0] = fma_lane_f64(op0.q[0], op1.q[0], op2.q[0], order, neg_prod, neg_add);
+    return out;
+}
+
+static Vec256 op_fma_ps(const Vec256& op0, const Vec256& op1, const Vec256& op2,
+                        unsigned order, unsigned mode, bool wide) {
+    Vec256 out{};
+    const unsigned lanes = wide ? 8u : 4u;
+    for (unsigned i = 0; i < lanes; ++i) {
+        bool neg_prod = false, neg_add = false;
+        fma_lane_signs(mode, i, neg_prod, neg_add);
+        set_lane32(out, i, fma_lane_f32(lane32(op0, i), lane32(op1, i), lane32(op2, i), order, neg_prod, neg_add));
+    }
+    return out;
+}
+
+static Vec256 op_fma_pd(const Vec256& op0, const Vec256& op1, const Vec256& op2,
+                        unsigned order, unsigned mode, bool wide) {
+    Vec256 out{};
+    const unsigned lanes = wide ? 4u : 2u;
+    for (unsigned i = 0; i < lanes; ++i) {
+        bool neg_prod = false, neg_add = false;
+        fma_lane_signs(mode, i, neg_prod, neg_add);
+        out.q[i] = fma_lane_f64(op0.q[i], op1.q[i], op2.q[i], order, neg_prod, neg_add);
+    }
+    return out;
+}
 """
 
 
@@ -670,6 +827,31 @@ def lift_code(name, start, raw):
                 helper = "op_vpmaskmovd_load" if elem_bits == 32 else "op_vpmaskmovq_load"
                 statements.append(f"{dst_name} = {helper}({mask_name}, {addr}, {'true' if wide else 'false'});")
                 defined.add(dst_idx)
+        elif ins.code in FMA3_SPECS:
+            kind, order, mode, wide = FMA3_SPECS[ins.code]
+            op0_name, op0_wide = read_vec(0, ins)
+            op1_name, op1_wide = read_vec(1, ins)
+            if op0_wide != wide or op1_wide != wide:
+                raise ValueError(f"FMA3 operand width mismatch at RVA {ins.ip:#x}: {ins}")
+            if ins.op2_kind == OpKind.REGISTER:
+                op2_expr, op2_wide = read_vec(2, ins)
+                if op2_wide != wide:
+                    raise ValueError(f"FMA3 operand width mismatch at RVA {ins.ip:#x}: {ins}")
+            elif ins.op2_kind == OpKind.MEMORY:
+                addr = flat_address(ins)
+                if kind == "ss":
+                    op2_expr = f"load_vec32({addr})"
+                elif kind == "sd":
+                    op2_expr = f"load_vec64({addr})"
+                else:
+                    op2_expr = f"{'load256' if wide else 'load128'}({addr})"
+            else:
+                raise ValueError(f"unsupported FMA3 operand 2 at RVA {ins.ip:#x}: {ins}")
+            if kind in ("ss", "sd"):
+                statements.append(f"{op0_name} = op_fma_{kind}({op0_name}, {op1_name}, {op2_expr}, {order}u, {mode}u);")
+            else:
+                statements.append(
+                    f"{op0_name} = op_fma_{kind}({op0_name}, {op1_name}, {op2_expr}, {order}u, {mode}u, {'true' if wide else 'false'});")
         else:
             raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
 

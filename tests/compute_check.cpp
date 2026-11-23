@@ -23,18 +23,6 @@ constexpr UINT sentinel = 0xc5c5c5c5u;
 constexpr std::array<UINT, 16> constants{count, 73, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 23, 29};
 }
 
-ComPtr<ID3D12Resource> make_buffer(ID3D12Device* device, UINT64 length, D3D12_HEAP_TYPE heap,
-                                   D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags)
-{
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = length;
-    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    desc.Flags = flags;
-    return resource(device, desc, heap, state);
-}
-
 static UINT input_word(UINT i) { return 0x8b02a7f1u + i * 0x413b1u; }
 
 static void fill_upload(ID3D12Resource* upload)
@@ -52,15 +40,6 @@ static void fill_upload(ID3D12Resource* upload)
     std::memcpy(cb, constants.data(), sizeof(constants));
     for (UINT i = 1; i < 4; ++i) std::memcpy(cb + i * alignment, &constants[12 + i], sizeof(UINT));
     upload->Unmap(0, nullptr);
-}
-
-void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* buffer,
-                D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
-{
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition = {buffer, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
-    list->ResourceBarrier(1, &barrier);
 }
 
 static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12GraphicsCommandList* list,
@@ -247,26 +226,4 @@ void check_bvh_root_roundtrip(ID3D12Device* device)
         throw std::runtime_error("Normalized signature differs from independent control serialization");
     run_compute(device, false, shader, {roundtrip->GetBufferPointer(), roundtrip->GetBufferSize()});
     std::puts("normalized_signature=matched_control root_creation=passed pipeline_creation=passed dispatch=passed");
-}
-
-ComputeCommands::ComputeCommands(ID3D12Device* device, ID3D12PipelineState* pipeline, D3D12_COMMAND_LIST_TYPE type)
-{
-    D3D12_COMMAND_QUEUE_DESC desc{};
-    desc.Type = type;
-    check(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)), "Create compute queue");
-    check(device->CreateCommandAllocator(desc.Type, IID_PPV_ARGS(&allocator)), "Create compute allocator");
-    check(device->CreateCommandList(0, desc.Type, allocator.Get(), pipeline, IID_PPV_ARGS(&list)),
-          "Create compute command list");
-}
-
-void ComputeCommands::submit_and_wait(ID3D12Device* device)
-{
-    check(list->Close(), "Close compute command list");
-    ComPtr<ID3D12Fence> fence;
-    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "Create compute fence");
-    ID3D12CommandList* submitted[]{list.Get()};
-    queue->ExecuteCommandLists(1, submitted);
-    check(queue->Signal(fence.Get(), 1), "Signal compute fence");
-    check(fence->SetEventOnCompletion(1, nullptr), "Wait for compute");
-    check(device->GetDeviceRemovedReason(), "Compute completion");
 }

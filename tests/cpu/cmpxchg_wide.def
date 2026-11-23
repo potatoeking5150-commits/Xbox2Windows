@@ -1,0 +1,3 @@
+EXPORTS
+    cmpxchg8b_op
+    cmpxchg16b_op

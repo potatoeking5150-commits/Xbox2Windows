@@ -1,0 +1,5 @@
+EXPORTS
+    rdseed_16
+    rdseed_32
+    rdseed_64
+    rdseed_unused

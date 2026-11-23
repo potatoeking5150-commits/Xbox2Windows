@@ -55,3 +55,15 @@ extern "C" HRESULT WINAPI d3d12_xs_CreateRootSignatureDeserializer(
     return D3D12CreateRootSignatureDeserializer(
         src_data, src_data_size_in_bytes, deserializer_interface, deserializer);
 }
+
+extern "C" HRESULT WINAPI d3d12_xs_XboxCreateDevice(
+    IUnknown* adapter, const void* parameters, REFIID iid, void** device)
+{
+    if (!device) return E_POINTER;
+    *device = nullptr;
+    // This entry supports an explicit desktop consumer of the returned interface.
+    // The Xbox parameter block and the Xbox device vtable require their own implementation.
+    if (parameters) return E_INVALIDARG;
+    if (iid != __uuidof(ID3D12Device)) return E_NOINTERFACE;
+    return D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, iid, device);
+}

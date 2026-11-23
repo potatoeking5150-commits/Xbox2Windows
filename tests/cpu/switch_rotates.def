@@ -1,0 +1,21 @@
+EXPORTS
+    rot_reg_cl_8
+    rot_reg_cl_16
+    rot_reg_cl_32
+    rot_reg_cl_64
+    rot_imm_1
+    rot_imm_edge
+    rot_mem_cl_8_16
+    rot_mem_cl_32_64
+    rot_mem_imm
+    rot_narrow_ret
+    neg_rol_jcc
+    neg_ror_jcc
+    neg_rol_setcc
+    neg_ror_setcc
+    neg_rol_cmovcc
+    neg_ror_cmovcc
+    neg_cmp_rol_setcc
+    neg_cmp_ror_setcc
+    neg_rol_undef
+    neg_rol_ah

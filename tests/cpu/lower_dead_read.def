@@ -1,0 +1,10 @@
+EXPORTS
+    read_dead
+    cmp_dead
+    test_dead
+    cmov_dead
+    add_in_place
+    read_live
+    fld_dead
+    read_vector_dead
+    copy_bytes

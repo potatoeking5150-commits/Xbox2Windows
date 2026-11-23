@@ -2,13 +2,14 @@
 
 Usage: require_warp_results.py <ctest-junit.xml>
 
-Hosted CI runs this after CTest so that a green run proves the four tests ran: a test that is
+Hosted CI runs this after CTest so that a green run proves each required test ran. A test that is
 missing from the report, skipped or failed fails this check.
 """
 import sys
 import xml.etree.ElementTree as ET
 
-REQUIRED = [f"spirv_{name}_warp" for name in ("address_window", "sampler_views", "ballot_extract", "compare_sampler")]
+REQUIRED = [f"spirv_{name}_warp" for name in ("address_window", "sampler_views", "ballot_extract",
+                                               "compaction", "compare_sampler", "minlod", "minlod_levels")]
 
 
 def statuses(junit):

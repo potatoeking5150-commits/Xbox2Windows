@@ -1,6 +1,12 @@
 struct Vertex { float4 uv : TEXCOORD0; float4 position : SV_Position; };
+// PIXEL_MIP_LINEAR builds the variant that blends neighboring mips, for MinLod filter checks.
+#ifdef PIXEL_MIP_LINEAR
+#define PIXEL_FILTER "FILTER_MIN_MAG_POINT_MIP_LINEAR"
+#else
+#define PIXEL_FILTER "FILTER_MIN_MAG_MIP_POINT"
+#endif
 [RootSignature("DescriptorTable(SRV(t0,numDescriptors=2),visibility=SHADER_VISIBILITY_PIXEL),CBV(b0,visibility=SHADER_VISIBILITY_PIXEL),"
-               "CBV(b1,visibility=SHADER_VISIBILITY_PIXEL),CBV(b2,visibility=SHADER_VISIBILITY_PIXEL),StaticSampler(s0,filter=FILTER_MIN_MAG_MIP_POINT,"
+               "CBV(b1,visibility=SHADER_VISIBILITY_PIXEL),CBV(b2,visibility=SHADER_VISIBILITY_PIXEL),StaticSampler(s0,filter=" PIXEL_FILTER ","
                "addressU=TEXTURE_ADDRESS_CLAMP,addressV=TEXTURE_ADDRESS_CLAMP,addressW=TEXTURE_ADDRESS_CLAMP)")]
 Vertex main(uint id : SV_VertexID)
 {

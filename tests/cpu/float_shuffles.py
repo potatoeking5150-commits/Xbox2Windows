@@ -59,7 +59,8 @@ def check(native_path, lifted_path):
     # A legacy XMM load without VMOVD still needs an XMM declaration.
     old_load = list(Decoder(64, bytes.fromhex("c5 fa 6f 01 31 c0 c3")))
     source = lower(old_load, [], {}, {}, {})
-    assert "__m128i xmm0" in source and "xmm0 = load<__m128i>" in source, source
+    assert "__m128i xmm0" in source and "xmm0 = mem;" in source, source
+    assert source.count("load_always<__m128i>(") == 1, source
 
     # Aligned memory moves require evidence that this profile does not have.
     for raw in ("66 0f 28 01 c3", "c5 f9 7f 01 c3"):

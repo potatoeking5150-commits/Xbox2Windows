@@ -9,12 +9,11 @@ the sink events with raw thread IDs translated to semantic identities
 ("main"/"worker") so two processes can be compared without comparing raw OS
 thread IDs.
 
-Expected differential (Refs #165): the Windows loader initializes implicit TLS
-and runs the callbacks on both threads with value 7; pe_map rejects the
-non-empty TLS data template with MAP_UNSUPPORTED ("TLS data") before any
-notification. The empty-template control (tls_route) must map under both
-loaders. A worker that times out, a missing callback, or an unexpected value
-fails the test.
+Expected (Refs #165): under both loaders implicit TLS is initialized and the
+callbacks run on both threads with value 7. pe_map serves the data template
+through a carrier DLL that Windows loads (tools/pe_map.cpp). The empty-template
+control (tls_route) must map under both loaders. A load failure, a worker that
+times out, a missing callback, or an unexpected value fails the test.
 """
 
 import argparse
@@ -25,7 +24,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from native_map_check import Mapper, STATUS
+from native_map_check import Mapper
 from native_tls_check import Call, load_sink
 
 TLS, ENTRY = 1, 2
@@ -73,7 +72,8 @@ def run(target, image, sink_path, mapper_path):
         release = lambda: kernel.FreeLibrary(module)  # noqa: E731
     else:
         mapper = Mapper(mapper_path)
-        bindings = {Path(sink_path).name.casefold(): sink}
+        # The fixture links the static C runtime, whose imports are bound to the host's system DLLs.
+        bindings = {Path(sink_path).name.casefold(): sink, "kernel32.dll": kernel}
         module, status, detail, _ = mapper(Path(image), bindings)
         if not module:
             print(json.dumps({"failure": [status, detail], "events": [], "main": None}))
@@ -182,8 +182,6 @@ def child(target, image, sink, mapper, control=False):
 def check(value_image, control_image, sink, mapper):
     # Control first: the empty-template fixture must load under both loaders,
     # proving the harness itself can map and observe thread notifications.
-    # MAP_UNSUPPORTED/"TLS data" below is therefore attributable to the data
-    # template, not to the harness, the sink, or the resolver.
     for target in ("native", "mapped"):
         observed = child(target, control_image, sink, mapper, control=True)
         if observed["failure"] is not None:
@@ -193,23 +191,6 @@ def check(value_image, control_image, sink, mapper):
             raise AssertionError(f"control {target}: missing attach callback: {observed}")
     print("control: empty-template TLS fixture loads under Windows and pe_map")
 
-    native = child("native", value_image, sink, mapper)
-    mapped = child("mapped", value_image, sink, mapper)
-    print(f"native: main={native['main']} worker={native['worker']} "
-          f"events={native['events']} detach={native.get('detach')}")
-    print(f"mapped: failure={mapped['failure']} events={mapped['events']}")
-
-    # Native must observe value 7 in every callback/entry on both threads.
-    if native["failure"] is not None:
-        raise AssertionError(f"native failed: {native}")
-    if native["main"] != TLS_VALUE or native["worker"] != TLS_VALUE:
-        raise AssertionError(f"native thread-local values differ from {TLS_VALUE}: {native}")
-    for label, seen in (("attach/worker", native["events"]), ("detach", native.get("detach", []))):
-        if not seen:
-            raise AssertionError(f"native {label}: missing TLS callbacks: {native}")
-        for caller, reason, who, value in seen:
-            if value != TLS_VALUE:
-                raise AssertionError(f"native {label}: value {value} != {TLS_VALUE}: {native}")
     expected_events = Counter(
         (caller, reason, thread, TLS_VALUE)
         for caller in (TLS, ENTRY)
@@ -217,26 +198,22 @@ def check(value_image, control_image, sink, mapper):
                                (THREAD_DETACH, "worker"))
     )
     expected_detach = Counter((caller, DETACH, "main", TLS_VALUE) for caller in (TLS, ENTRY))
-    for observed, expected in ((native["events"], expected_events),
-                               (native["detach"], expected_detach)):
-        if Counter(map(tuple, observed)) != expected:
-            raise AssertionError(f"native: expected {expected}, got {observed}")
+    for target in ("native", "mapped"):
+        seen = child(target, value_image, sink, mapper)
+        print(f"{target}: main={seen.get('main')} worker={seen.get('worker')} "
+              f"events={seen['events']} detach={seen.get('detach')}")
+        # Every callback and entry-point call on both threads must observe value 7.
+        if seen["failure"] is not None:
+            raise AssertionError(f"{target} failed: {seen}")
+        if seen["main"] != TLS_VALUE or seen["worker"] != TLS_VALUE:
+            raise AssertionError(f"{target} thread-local values differ from {TLS_VALUE}: {seen}")
+        for observed, expected in ((seen["events"], expected_events),
+                                   (seen["detach"], expected_detach)):
+            if Counter(map(tuple, observed)) != expected:
+                raise AssertionError(f"{target}: expected {expected}, got {observed}")
 
-    # pe_map must reject the non-empty TLS template before any notification.
-    if mapped["failure"] != [STATUS["unsupported"], "TLS data"]:
-        raise AssertionError(f"mapped: expected [6, 'TLS data'], got {mapped}")
-    if mapped["events"] or mapped.get("detach"):
-        raise AssertionError(f"mapped: notifications were sent before rejection: {mapped}")
-    if mapped["main"] is not None:
-        raise AssertionError(f"mapped: main value observed despite rejection: {mapped}")
-
-    # Determinism: a second mapped attempt fails identically.
-    again = child("mapped", value_image, sink, mapper)
-    if again != mapped:
-        raise AssertionError(f"mapped repeat differs: {again} vs {mapped}")
-
-    print(f"native TLS callbacks on main and worker threads all read {TLS_VALUE}; "
-          f"pe_map rejects the image with unsupported/TLS data and sends no notifications")
+    print(f"TLS callbacks and entry points on the main and worker threads all read {TLS_VALUE} "
+          f"under Windows and under pe_map")
 
 
 if __name__ == "__main__":

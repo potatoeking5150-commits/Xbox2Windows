@@ -20,9 +20,9 @@ otherwise.
 
 - Never add game files, dumps, DLLs, EXEs, torrents, distribution links or
   credentials to the repository, issues or pull requests.
-- The GitHub repository description and the opening paragraph of README.md may
-  name the case-study title when describing static recompilation research. Keep
-  other public wording title-neutral. Do not claim that a game runs.
+- Keep public project wording title-neutral, including the repository
+  description and README. Describe results in terms of the platform, component
+  or fixture tested. Do not claim that a game runs.
 - Use only source-built fixtures, synthetic inputs or public samples with a
   known revision and license.
 - Keep generated output under `out/` and local inputs under `game-files/`.
@@ -101,10 +101,12 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/script_state_check.py
 ./out/pe-env/bin/python -B tests/resource_root_check.py
 ./out/pe-env/bin/python -B tests/bcpack_check.py
+./out/pe-env/bin/python -B tests/bcpack_symbols_check.py
 ./out/pe-env/bin/python -B tests/bc7_blocks_check.py
 ./out/pe-env/bin/python -B tests/bc7_tiles_check.py
 ./out/pe-env/bin/python -B tests/form_coverage_check.py
 ./out/pe-env/bin/python -B tests/resource_ranges_check.py
+./out/pe-env/bin/python -B tests/ttpf_batch_export_check.py
 ./out/pe-env/bin/python -B tests/awc_metadata_check.py
 ./out/pe-env/bin/python -B tests/sgd5_effects_check.py
 ./out/pe-env/bin/python -B tests/dxcontainer_part_offsets_check.py

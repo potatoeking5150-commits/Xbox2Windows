@@ -40,11 +40,11 @@ EXPORTS = (
 # Source mutations of the generated C++. Each control DLL must disagree with the reference somewhere.
 CONTROLS = {
     # A whole-range memmove gives the same bytes only when the ranges do not overlap forward.
-    "memmove": (re.compile(r"while \(rcx != 0\) \{ store<(\w+)>\(rdi, load<\1>\(rsi\)\); rsi \+= step; rdi \+= step; --rcx; \}"),
+    "memmove": (re.compile(r"while \(rcx != 0\) \{ store<(\w+)>\(rdi, load(?:_always)?<\1>\(rsi\)\); rsi \+= step; rdi \+= step; --rcx; \}"),
                 r"if (rcx != 0) { std::memmove(reinterpret_cast<void*>(rdi), reinterpret_cast<const void*>(rsi), "
                 r"rcx * sizeof(\1)); rsi += rcx * step; rdi += rcx * step; rcx = 0; }"),
     # CMPS subtracts the destination element from the source element.
-    "swapped": (re.compile(r"a = load<(\w+)>\(rsi\), b = load<\1>\(rdi\)"), r"a = load<\1>(rdi), b = load<\1>(rsi)"),
+    "swapped": (re.compile(r"a = load_always<(\w+)>\(rsi\), b = load_always<\1>\(rdi\)"), r"a = load_always<\1>(rdi), b = load_always<\1>(rsi)"),
     # STD walks the pointers downward.
     "forward": (re.compile(r"direction = true;"), "direction = false;"),
 }

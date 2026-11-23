@@ -15,6 +15,21 @@ import struct
 import sys
 
 # Register decode helpers
+
+# Source operand codes that name hardware values rather than SGPRs (LLVM spellings).
+SPECIAL_SRC_OPERANDS = {
+    235: "src_shared_base",
+    236: "src_shared_limit",
+    237: "src_private_base",
+    238: "src_private_limit",
+    239: "src_pops_exiting_wave_id",
+    251: "src_vccz",
+    252: "src_execz",
+    253: "src_scc",
+    254: "src_lds_direct",
+}
+
+
 def decode_s_reg(reg_id: int) -> str:
     """Decode scalar register or scalar constant code."""
     if reg_id <= 105:
@@ -53,6 +68,10 @@ def decode_s_reg(reg_id: int) -> str:
         return "4.0"
     if reg_id == 247:
         return "-4.0"
+    if reg_id == 248:
+        return "0.15915494"
+    if reg_id in SPECIAL_SRC_OPERANDS:
+        return SPECIAL_SRC_OPERANDS[reg_id]
     if reg_id == 255:
         return "literal"
     return f"s{reg_id}"
@@ -71,6 +90,8 @@ def decode_s_reg64(reg_id: int) -> str:
         return "null"
     if reg_id == 126:
         return "exec"
+    if reg_id == 248:
+        return "0.15915494309189532"
     return decode_s_reg(reg_id)
 
 
@@ -128,6 +149,7 @@ SOP1_OPS = {
     0x0a: ("s_wqm_b64", "Scalar whole-quad-mode 64-bit"),
     0x20: ("s_setpc_b64", "Set program counter 64-bit"),
     0x21: ("s_swappc_b64", "Swap program counter 64-bit"),
+    0x3c: ("s_and_saveexec_b32", "Save execution mask and bitwise AND with scalar source"),
 }
 
 SOP2_OPS = {
@@ -164,6 +186,7 @@ SOP2_OPS = {
 
 SOPK_OPS = {
     0x00: ("s_movk_i32", "Scalar move 16-bit sign-extended immediate"),
+    0x01: ("s_version", "Version marker with a 16-bit immediate, no destination"),
     0x02: ("s_cmovk_i32", "Scalar conditional move immediate"),
     0x03: ("s_cmpk_eq_i32", "Scalar compare equal immediate"),
     0x04: ("s_cmpk_lg_i32", "Scalar compare not-equal immediate"),
@@ -267,8 +290,14 @@ VOP1_OPS = {
     0x08: ("v_cvt_i32_f32_e32", "Convert float32 to int32"),
     0x0a: ("v_cvt_f16_f32_e32", "Convert float32 to float16"),
     0x0b: ("v_cvt_f32_f16_e32", "Convert float16 to float32"),
+    0x0c: ("v_cvt_rpi_i32_f32_e32", "Convert float32 to int32 (round to +inf)"),
+    0x0d: ("v_cvt_flr_i32_f32_e32", "Convert float32 to int32 (floor)"),
     0x0f: ("v_cvt_f32_f64_e32", "Convert float64 to float32"),
     0x10: ("v_cvt_f64_f32_e32", "Convert float32 to float64"),
+    0x11: ("v_cvt_f32_ubyte0_e32", "Convert unsigned byte 0 to float32"),
+    0x12: ("v_cvt_f32_ubyte1_e32", "Convert unsigned byte 1 to float32"),
+    0x13: ("v_cvt_f32_ubyte2_e32", "Convert unsigned byte 2 to float32"),
+    0x14: ("v_cvt_f32_ubyte3_e32", "Convert unsigned byte 3 to float32"),
     0x15: ("v_cvt_u32_f64_e32", "Convert float64 to uint32"),
     0x16: ("v_cvt_f64_u32_e32", "Convert uint32 to float64"),
     0x20: ("v_fract_f32_e32", "Fractional part float32"),
@@ -507,6 +536,7 @@ VOP2_OPS = {
     0x1b: ("v_and_b32_e32", "Vector bitwise AND"),
     0x1c: ("v_or_b32_e32", "Vector bitwise OR"),
     0x1d: ("v_xor_b32_e32", "Vector bitwise XOR"),
+    0x1f: ("v_mac_f32_e32", "Vector multiply-accumulate float32"),
     0x20: ("v_madmk_f32", "Vector multiply-add (non-fused) with literal multiplier"),
     0x21: ("v_madak_f32", "Vector multiply-add (non-fused) with literal addend"),
     0x25: ("v_add_nc_u32_e32", "Vector add uint32 without carry"),
@@ -525,6 +555,7 @@ VOP3_NATIVE_OPS = {
     0x129: ("v_sub_co_ci_u32_e64", "V_SUB_CO_CI_U32 (VOP3B)", 3, True, 1, (1, 1, 1)),
     0x12a: ("v_subrev_co_ci_u32_e64", "V_SUBREV_CO_CI_U32 (VOP3B)", 3, True, 1, (1, 1, 1)),
     0x140: ("v_mad_legacy_f32", "V_MAD_LEGACY_F32 (VOP3A)", 3, False, 1, (1, 1, 1)),
+    0x141: ("v_mad_f32", "V_MAD_F32 (VOP3A)", 3, False, 1, (1, 1, 1)),
     0x142: ("v_mad_i32_i24", "V_MAD_I32_I24 (VOP3A)", 3, False, 1, (1, 1, 1)),
     0x143: ("v_mad_u32_u24", "V_MAD_U32_U24 (VOP3A)", 3, False, 1, (1, 1, 1)),
     0x144: ("v_cubeid_f32", "V_CUBEID_F32 (VOP3A)", 3, False, 1, (1, 1, 1)),
@@ -1097,6 +1128,258 @@ def _decode_flat_family(w0: int, w1: int) -> tuple[int, str, str, str]:
     return (8, op_name, asm, comment)
 
 
+# GFX1013 DS (LDS / GDS) opcode table:
+# opcode -> (mnemonic, vdst_width, has_addr, data0_width, data1_width, offset_mode, gds_mode)
+# where offset_mode is 'none' | 'single' | 'dual' | 'swizzle' and gds_mode is 'optional' | 'gds_only' | 'no_gds'.
+DS_OPS = {
+    0x00: ("ds_add_u32", 0, True, 1, 0, "single", "optional"),
+    0x01: ("ds_sub_u32", 0, True, 1, 0, "single", "optional"),
+    0x02: ("ds_rsub_u32", 0, True, 1, 0, "single", "optional"),
+    0x03: ("ds_inc_u32", 0, True, 1, 0, "single", "optional"),
+    0x04: ("ds_dec_u32", 0, True, 1, 0, "single", "optional"),
+    0x05: ("ds_min_i32", 0, True, 1, 0, "single", "optional"),
+    0x06: ("ds_max_i32", 0, True, 1, 0, "single", "optional"),
+    0x07: ("ds_min_u32", 0, True, 1, 0, "single", "optional"),
+    0x08: ("ds_max_u32", 0, True, 1, 0, "single", "optional"),
+    0x09: ("ds_and_b32", 0, True, 1, 0, "single", "optional"),
+    0x0a: ("ds_or_b32", 0, True, 1, 0, "single", "optional"),
+    0x0b: ("ds_xor_b32", 0, True, 1, 0, "single", "optional"),
+    0x0c: ("ds_mskor_b32", 0, True, 1, 1, "single", "optional"),
+    0x0d: ("ds_write_b32", 0, True, 1, 0, "single", "optional"),
+    0x0e: ("ds_write2_b32", 0, True, 1, 1, "dual", "optional"),
+    0x0f: ("ds_write2st64_b32", 0, True, 1, 1, "dual", "optional"),
+    0x10: ("ds_cmpst_b32", 0, True, 1, 1, "single", "optional"),
+    0x11: ("ds_cmpst_f32", 0, True, 1, 1, "single", "optional"),
+    0x12: ("ds_min_f32", 0, True, 1, 0, "single", "optional"),
+    0x13: ("ds_max_f32", 0, True, 1, 0, "single", "optional"),
+    0x14: ("ds_nop", 0, False, 0, 0, "none", "no_gds"),
+    0x15: ("ds_add_f32", 0, True, 1, 0, "single", "optional"),
+    0x18: ("ds_gws_sema_release_all", 0, False, 0, 0, "single", "gds_only"),
+    0x19: ("ds_gws_init", 0, True, 0, 0, "single", "gds_only"),
+    0x1a: ("ds_gws_sema_v", 0, False, 0, 0, "single", "gds_only"),
+    0x1b: ("ds_gws_sema_br", 0, True, 0, 0, "single", "gds_only"),
+    0x1c: ("ds_gws_sema_p", 0, False, 0, 0, "single", "gds_only"),
+    0x1d: ("ds_gws_barrier", 0, True, 0, 0, "single", "gds_only"),
+    0x1e: ("ds_write_b8", 0, True, 1, 0, "single", "optional"),
+    0x1f: ("ds_write_b16", 0, True, 1, 0, "single", "optional"),
+    0x20: ("ds_add_rtn_u32", 1, True, 1, 0, "single", "optional"),
+    0x21: ("ds_sub_rtn_u32", 1, True, 1, 0, "single", "optional"),
+    0x22: ("ds_rsub_rtn_u32", 1, True, 1, 0, "single", "optional"),
+    0x23: ("ds_inc_rtn_u32", 1, True, 1, 0, "single", "optional"),
+    0x24: ("ds_dec_rtn_u32", 1, True, 1, 0, "single", "optional"),
+    0x25: ("ds_min_rtn_i32", 1, True, 1, 0, "single", "optional"),
+    0x26: ("ds_max_rtn_i32", 1, True, 1, 0, "single", "optional"),
+    0x27: ("ds_min_rtn_u32", 1, True, 1, 0, "single", "optional"),
+    0x28: ("ds_max_rtn_u32", 1, True, 1, 0, "single", "optional"),
+    0x29: ("ds_and_rtn_b32", 1, True, 1, 0, "single", "optional"),
+    0x2a: ("ds_or_rtn_b32", 1, True, 1, 0, "single", "optional"),
+    0x2b: ("ds_xor_rtn_b32", 1, True, 1, 0, "single", "optional"),
+    0x2c: ("ds_mskor_rtn_b32", 1, True, 1, 1, "single", "optional"),
+    0x2d: ("ds_wrxchg_rtn_b32", 1, True, 1, 0, "single", "optional"),
+    0x2e: ("ds_wrxchg2_rtn_b32", 2, True, 1, 1, "dual", "optional"),
+    0x2f: ("ds_wrxchg2st64_rtn_b32", 2, True, 1, 1, "dual", "optional"),
+    0x30: ("ds_cmpst_rtn_b32", 1, True, 1, 1, "single", "optional"),
+    0x31: ("ds_cmpst_rtn_f32", 1, True, 1, 1, "single", "optional"),
+    0x32: ("ds_min_rtn_f32", 1, True, 1, 0, "single", "optional"),
+    0x33: ("ds_max_rtn_f32", 1, True, 1, 0, "single", "optional"),
+    0x34: ("ds_wrap_rtn_b32", 1, True, 1, 1, "single", "optional"),
+    0x35: ("ds_swizzle_b32", 1, True, 0, 0, "swizzle", "optional"),
+    0x36: ("ds_read_b32", 1, True, 0, 0, "single", "optional"),
+    0x37: ("ds_read2_b32", 2, True, 0, 0, "dual", "optional"),
+    0x38: ("ds_read2st64_b32", 2, True, 0, 0, "dual", "optional"),
+    0x39: ("ds_read_i8", 1, True, 0, 0, "single", "optional"),
+    0x3a: ("ds_read_u8", 1, True, 0, 0, "single", "optional"),
+    0x3b: ("ds_read_i16", 1, True, 0, 0, "single", "optional"),
+    0x3c: ("ds_read_u16", 1, True, 0, 0, "single", "optional"),
+    0x3d: ("ds_consume", 1, False, 0, 0, "single", "optional"),
+    0x3e: ("ds_append", 1, False, 0, 0, "single", "optional"),
+    0x3f: ("ds_ordered_count", 1, True, 0, 0, "single", "gds_only"),
+    0x40: ("ds_add_u64", 0, True, 2, 0, "single", "optional"),
+    0x41: ("ds_sub_u64", 0, True, 2, 0, "single", "optional"),
+    0x42: ("ds_rsub_u64", 0, True, 2, 0, "single", "optional"),
+    0x43: ("ds_inc_u64", 0, True, 2, 0, "single", "optional"),
+    0x44: ("ds_dec_u64", 0, True, 2, 0, "single", "optional"),
+    0x45: ("ds_min_i64", 0, True, 2, 0, "single", "optional"),
+    0x46: ("ds_max_i64", 0, True, 2, 0, "single", "optional"),
+    0x47: ("ds_min_u64", 0, True, 2, 0, "single", "optional"),
+    0x48: ("ds_max_u64", 0, True, 2, 0, "single", "optional"),
+    0x49: ("ds_and_b64", 0, True, 2, 0, "single", "optional"),
+    0x4a: ("ds_or_b64", 0, True, 2, 0, "single", "optional"),
+    0x4b: ("ds_xor_b64", 0, True, 2, 0, "single", "optional"),
+    0x4c: ("ds_mskor_b64", 0, True, 2, 2, "single", "optional"),
+    0x4d: ("ds_write_b64", 0, True, 2, 0, "single", "optional"),
+    0x4e: ("ds_write2_b64", 0, True, 2, 2, "dual", "optional"),
+    0x4f: ("ds_write2st64_b64", 0, True, 2, 2, "dual", "optional"),
+    0x50: ("ds_cmpst_b64", 0, True, 2, 2, "single", "optional"),
+    0x51: ("ds_cmpst_f64", 0, True, 2, 2, "single", "optional"),
+    0x52: ("ds_min_f64", 0, True, 2, 0, "single", "optional"),
+    0x53: ("ds_max_f64", 0, True, 2, 0, "single", "optional"),
+    0x55: ("ds_add_rtn_f32", 1, True, 1, 0, "single", "optional"),
+    0x60: ("ds_add_rtn_u64", 2, True, 2, 0, "single", "optional"),
+    0x61: ("ds_sub_rtn_u64", 2, True, 2, 0, "single", "optional"),
+    0x62: ("ds_rsub_rtn_u64", 2, True, 2, 0, "single", "optional"),
+    0x63: ("ds_inc_rtn_u64", 2, True, 2, 0, "single", "optional"),
+    0x64: ("ds_dec_rtn_u64", 2, True, 2, 0, "single", "optional"),
+    0x65: ("ds_min_rtn_i64", 2, True, 2, 0, "single", "optional"),
+    0x66: ("ds_max_rtn_i64", 2, True, 2, 0, "single", "optional"),
+    0x67: ("ds_min_rtn_u64", 2, True, 2, 0, "single", "optional"),
+    0x68: ("ds_max_rtn_u64", 2, True, 2, 0, "single", "optional"),
+    0x69: ("ds_and_rtn_b64", 2, True, 2, 0, "single", "optional"),
+    0x6a: ("ds_or_rtn_b64", 2, True, 2, 0, "single", "optional"),
+    0x6b: ("ds_xor_rtn_b64", 2, True, 2, 0, "single", "optional"),
+    0x6c: ("ds_mskor_rtn_b64", 2, True, 2, 2, "single", "optional"),
+    0x6d: ("ds_wrxchg_rtn_b64", 2, True, 2, 0, "single", "optional"),
+    0x6e: ("ds_wrxchg2_rtn_b64", 4, True, 2, 2, "dual", "optional"),
+    0x6f: ("ds_wrxchg2st64_rtn_b64", 4, True, 2, 2, "dual", "optional"),
+    0x70: ("ds_cmpst_rtn_b64", 2, True, 2, 2, "single", "optional"),
+    0x71: ("ds_cmpst_rtn_f64", 2, True, 2, 2, "single", "optional"),
+    0x72: ("ds_min_rtn_f64", 2, True, 2, 0, "single", "optional"),
+    0x73: ("ds_max_rtn_f64", 2, True, 2, 0, "single", "optional"),
+    0x76: ("ds_read_b64", 2, True, 0, 0, "single", "optional"),
+    0x77: ("ds_read2_b64", 4, True, 0, 0, "dual", "optional"),
+    0x78: ("ds_read2st64_b64", 4, True, 0, 0, "dual", "optional"),
+    0x7e: ("ds_condxchg32_rtn_b64", 2, True, 2, 0, "single", "optional"),
+    0x80: ("ds_add_src2_u32", 0, True, 0, 0, "single", "optional"),
+    0x81: ("ds_sub_src2_u32", 0, True, 0, 0, "single", "optional"),
+    0x82: ("ds_rsub_src2_u32", 0, True, 0, 0, "single", "optional"),
+    0x83: ("ds_inc_src2_u32", 0, True, 0, 0, "single", "optional"),
+    0x84: ("ds_dec_src2_u32", 0, True, 0, 0, "single", "optional"),
+    0x85: ("ds_min_src2_i32", 0, True, 0, 0, "single", "optional"),
+    0x86: ("ds_max_src2_i32", 0, True, 0, 0, "single", "optional"),
+    0x87: ("ds_min_src2_u32", 0, True, 0, 0, "single", "optional"),
+    0x88: ("ds_max_src2_u32", 0, True, 0, 0, "single", "optional"),
+    0x89: ("ds_and_src2_b32", 0, True, 0, 0, "single", "optional"),
+    0x8a: ("ds_or_src2_b32", 0, True, 0, 0, "single", "optional"),
+    0x8b: ("ds_xor_src2_b32", 0, True, 0, 0, "single", "optional"),
+    0x8d: ("ds_write_src2_b32", 0, True, 0, 0, "single", "optional"),
+    0x92: ("ds_min_src2_f32", 0, True, 0, 0, "single", "optional"),
+    0x93: ("ds_max_src2_f32", 0, True, 0, 0, "single", "optional"),
+    0x95: ("ds_add_src2_f32", 0, True, 0, 0, "single", "optional"),
+    0xa0: ("ds_write_b8_d16_hi", 0, True, 1, 0, "single", "optional"),
+    0xa1: ("ds_write_b16_d16_hi", 0, True, 1, 0, "single", "optional"),
+    0xa2: ("ds_read_u8_d16", 1, True, 0, 0, "single", "optional"),
+    0xa3: ("ds_read_u8_d16_hi", 1, True, 0, 0, "single", "optional"),
+    0xa4: ("ds_read_i8_d16", 1, True, 0, 0, "single", "optional"),
+    0xa5: ("ds_read_i8_d16_hi", 1, True, 0, 0, "single", "optional"),
+    0xa6: ("ds_read_u16_d16", 1, True, 0, 0, "single", "optional"),
+    0xa7: ("ds_read_u16_d16_hi", 1, True, 0, 0, "single", "optional"),
+    0xb0: ("ds_write_addtid_b32", 0, False, 1, 0, "single", "optional"),
+    0xb1: ("ds_read_addtid_b32", 1, False, 0, 0, "single", "optional"),
+    0xb2: ("ds_permute_b32", 1, True, 1, 0, "single", "no_gds"),
+    0xb3: ("ds_bpermute_b32", 1, True, 1, 0, "single", "no_gds"),
+    0xc0: ("ds_add_src2_u64", 0, True, 0, 0, "single", "optional"),
+    0xc1: ("ds_sub_src2_u64", 0, True, 0, 0, "single", "optional"),
+    0xc2: ("ds_rsub_src2_u64", 0, True, 0, 0, "single", "optional"),
+    0xc3: ("ds_inc_src2_u64", 0, True, 0, 0, "single", "optional"),
+    0xc4: ("ds_dec_src2_u64", 0, True, 0, 0, "single", "optional"),
+    0xc5: ("ds_min_src2_i64", 0, True, 0, 0, "single", "optional"),
+    0xc6: ("ds_max_src2_i64", 0, True, 0, 0, "single", "optional"),
+    0xc7: ("ds_min_src2_u64", 0, True, 0, 0, "single", "optional"),
+    0xc8: ("ds_max_src2_u64", 0, True, 0, 0, "single", "optional"),
+    0xc9: ("ds_and_src2_b64", 0, True, 0, 0, "single", "optional"),
+    0xca: ("ds_or_src2_b64", 0, True, 0, 0, "single", "optional"),
+    0xcb: ("ds_xor_src2_b64", 0, True, 0, 0, "single", "optional"),
+    0xcd: ("ds_write_src2_b64", 0, True, 0, 0, "single", "optional"),
+    0xd2: ("ds_min_src2_f64", 0, True, 0, 0, "single", "optional"),
+    0xd3: ("ds_max_src2_f64", 0, True, 0, 0, "single", "optional"),
+    0xde: ("ds_write_b96", 0, True, 3, 0, "single", "optional"),
+    0xdf: ("ds_write_b128", 0, True, 4, 0, "single", "optional"),
+    0xfe: ("ds_read_b96", 3, True, 0, 0, "single", "optional"),
+    0xff: ("ds_read_b128", 4, True, 0, 0, "single", "optional"),
+}
+
+
+def _format_ds_swizzle(imm: int) -> str | None:
+    """Format the 16-bit offset field of ds_swizzle_b32 like LLVM AMDGPUInstPrinter."""
+    if imm == 0:
+        return None
+    if imm & 0x8000:
+        if (imm & 0xff00) == 0x8000:
+            lanes = ",".join(str((imm >> (2 * i)) & 3) for i in range(4))
+            return f"offset:swizzle(QUAD_PERM,{lanes})"
+        return f"offset:{imm}"
+    and_mask = imm & 0x1f
+    or_mask = (imm >> 5) & 0x1f
+    xor_mask = (imm >> 10) & 0x1f
+    if and_mask == 0x1f and or_mask == 0:
+        if xor_mask in (1, 2, 4, 8, 16):
+            return f"offset:swizzle(SWAP,{xor_mask})"
+        if xor_mask in (3, 7, 15, 31):
+            return f"offset:swizzle(REVERSE,{xor_mask + 1})"
+    broadcast_groups = {0x1e: 2, 0x1c: 4, 0x18: 8, 0x10: 16, 0x00: 32}
+    if xor_mask == 0 and and_mask in broadcast_groups and (or_mask & and_mask) == 0:
+        return f"offset:swizzle(BROADCAST,{broadcast_groups[and_mask]},{or_mask})"
+    chars = []
+    for bit in range(4, -1, -1):
+        ab = (and_mask >> bit) & 1
+        ob = (or_mask >> bit) & 1
+        xb = (xor_mask >> bit) & 1
+        if ab == 0 or ob == 1:
+            chars.append(str(ob ^ xb))
+        else:
+            chars.append("i" if xb else "p")
+    return f'offset:swizzle(BITMASK_PERM,"{"".join(chars)}")'
+
+
+def _decode_ds(w0: int, w1: int) -> tuple[int, str, str, str]:
+    """Decode one 64-bit DS (Local / Global Data Share) instruction."""
+    op = (w0 >> 18) & 0xff
+    gds = (w0 >> 17) & 1
+    offset0 = w0 & 0xff
+    offset1 = (w0 >> 8) & 0xff
+    offset16 = w0 & 0xffff
+
+    addr = w1 & 0xff
+    data0 = (w1 >> 8) & 0xff
+    data1 = (w1 >> 16) & 0xff
+    vdst = (w1 >> 24) & 0xff
+
+    entry = DS_OPS.get(op)
+    if entry is None:
+        return (8, f"ds_op_{op:02x}", f"ds_op_{op:02x}", f"Unknown DS opcode 0x{op:02x}")
+
+    op_name, vdst_w, has_addr, data0_w, data1_w, offset_mode, gds_mode = entry
+    if (gds_mode == "gds_only" and not gds) or (gds_mode == "no_gds" and gds):
+        return (8, f"ds_op_{op:02x}", f"ds_op_{op:02x}", f"Unsupported DS gds={gds} for {op_name}")
+    if offset_mode == "none" and offset16 != 0:
+        return (8, f"ds_op_{op:02x}", f"ds_op_{op:02x}", f"Unsupported DS offset={offset16} for {op_name}")
+
+    operands = []
+    if vdst_w:
+        operands.append(_format_vgpr_range(vdst, vdst_w))
+    if has_addr:
+        operands.append(f"v{addr}")
+    if data0_w:
+        operands.append(_format_vgpr_range(data0, data0_w))
+    if data1_w:
+        operands.append(_format_vgpr_range(data1, data1_w))
+
+    mods = []
+    if offset_mode == "single":
+        if offset16 != 0:
+            mods.append(f"offset:{offset16}")
+    elif offset_mode == "dual":
+        if offset0 != 0:
+            mods.append(f"offset0:{offset0}")
+        if offset1 != 0:
+            mods.append(f"offset1:{offset1}")
+    elif offset_mode == "swizzle":
+        swizzle = _format_ds_swizzle(offset16)
+        if swizzle is not None:
+            mods.append(swizzle)
+
+    if gds:
+        mods.append("gds")
+
+    asm = op_name
+    if operands:
+        asm += f" {', '.join(operands)}"
+    if mods:
+        asm += f" {' '.join(mods)}"
+    comment = "GDS data share" if gds else "LDS data share"
+    return (8, op_name, asm, comment)
+
+
 def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
     """
     Decode one RDNA 2 instruction at given offset.
@@ -1197,6 +1480,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
                 return (4, "sopk_truncated", f"{op_name} <truncated>", "Incomplete SOPK literal")
             literal, = struct.unpack_from("<I", data, offset + 4)
             return (8, op_name, f"{op_name} 0x{simm:x}, 0x{literal:x}", comment)
+        if op_name == "s_version":
+            # No destination operand; the SDST field is not printed.
+            return (4, op_name, f"{op_name} 0x{simm:x}", comment)
         asm = f"{op_name} {decode_s_reg(sdst)}, 0x{simm:x}"
         return (4, op_name, asm, comment)
 
@@ -1587,6 +1873,13 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             return (4, "flat_truncated", "flat <truncated>", "Incomplete 64-bit FLAT/GLOBAL/SCRATCH instruction")
         w1, = struct.unpack_from("<I", data, offset + 4)
         return _decode_flat_family(w0, w1)
+
+    # DS: 64-bit [31:26] == 0b110110 (0xd8000000)
+    if (w0 & 0xfc000000) == 0xd8000000:
+        if offset + 8 > len(data):
+            return (4, "ds_truncated", "ds <truncated>", "Incomplete 64-bit DS instruction")
+        w1, = struct.unpack_from("<I", data, offset + 4)
+        return _decode_ds(w0, w1)
 
     # 15. VOP3A / VOP3B: 64-bit [31:26] == 0b110101 (0xd4000000)
     if (w0 & 0xfc000000) == 0xd4000000:

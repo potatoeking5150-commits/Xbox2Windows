@@ -52,11 +52,11 @@ CONTROLS = {
     # FIDIV divides the integer by ST(0), as FIDIVR does.
     "divrev": (re.compile(r"= x87_div\((.*)  // fidiv "), r"= x87_divr(\1  // fidiv "),
     # An m16 integer is zero-extended instead of sign-extended.
-    "zext16": (re.compile(r"static_cast<int16_t>\(load<uint16_t>\(a\)\)"), "static_cast<int64_t>(load<uint16_t>(a))"),
+    "zext16": (re.compile(r"static_cast<int16_t>\((load(?:_always)?)<uint16_t>\(a\)\)"), r"static_cast<int64_t>(\1<uint16_t>(a))"),
     # An m32 integer is zero-extended instead of sign-extended.
-    "zext32": (re.compile(r"static_cast<int32_t>\(load<uint32_t>\(a\)\)"), "static_cast<int64_t>(load<uint32_t>(a))"),
+    "zext32": (re.compile(r"static_cast<int32_t>\((load(?:_always)?)<uint32_t>\(a\)\)"), r"static_cast<int64_t>(\1<uint32_t>(a))"),
     # An m16 integer is read as 32 bits; the two bytes after each m16 operand are not a sign extension.
-    "wide16": (re.compile(r"static_cast<int16_t>\(load<uint16_t>\(a\)\)"), "static_cast<int32_t>(load<uint32_t>(a))"),
+    "wide16": (re.compile(r"static_cast<int16_t>\((load(?:_always)?)<uint16_t>\(a\)\)"), r"static_cast<int32_t>(\1<uint32_t>(a))"),
     # The result keeps 64 significand bits, as if the precision control did not apply.
     "pc64": (re.compile(r"x87_arith\{53, 16383, 0x7ffe\}"), "x87_arith{64, 16383, 0x7ffe}"),
 }

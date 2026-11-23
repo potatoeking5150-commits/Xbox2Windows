@@ -17,3 +17,21 @@ EXPORTS
     crc32_8_op
     crc32_32_op
     crc32_64_op
+    pcmpestri_ub_eqany_pos_lsb
+    pcmpestri_sw_ranges_neg_msb
+    pcmpestri_sb_eqeach_mpos_msb
+    pcmpestri_uw_eqord_mneg_lsb
+    pcmpestrm_ub_eqany_pos_bit
+    pcmpestrm_sb_ranges_neg_exp
+    pcmpestrm_uw_eqeach_mpos_exp
+    pcmpestrm_sw_eqord_mneg_bit
+    pcmpistri_ub_eqord_pos_lsb
+    pcmpistri_sb_ranges_mneg_msb
+    pcmpistri_uw_eqany_neg_msb
+    pcmpistri_sw_eqeach_mpos_lsb
+    pcmpistrm_ub_eqeach_pos_exp
+    pcmpistrm_sw_eqany_mneg_exp
+    pcmpistrm_uw_ranges_mpos_bit
+    pcmpistrm_sb_eqord_neg_bit
+    pcmpestrm_ymm_preserve
+    pcmpistrm_ymm_preserve

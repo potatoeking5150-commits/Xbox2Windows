@@ -1,14 +1,20 @@
 // Map an x64 PE image without LoadLibrary and bind its imports through a host resolver.
 // Scope: DIR64/HIGHLOW relocations, ordinary and delay imports by name or ordinal, section protections,
 // .pdata registration, TLS callbacks and the entry point. Delay imports are bound eagerly: the
-// image's delay-load helper would call LoadLibrary and bypass the host resolver. TLS data
-// templates are rejected. Header fields are checked against the file or SizeOfImage before use.
+// image's delay-load helper would call LoadLibrary and bypass the host resolver. An implicit TLS
+// data template is served through a generated carrier DLL that Windows loads (see TlsCarrier).
+// Header fields are checked against the file or SizeOfImage before use.
 #include <windows.h>
+
+#include <bcrypt.h>
+#include <psapi.h>
+#include <sddl.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <new>
 #include <string>
 #include <vector>
@@ -216,6 +222,329 @@ BOOL notify(const Image& image, const IMAGE_NT_HEADERS64* nt, const std::vector<
     return entry(reinterpret_cast<HINSTANCE>(image.base), reason, nullptr);
 }
 
+// Implicit TLS data. Compiled code reaches a thread-local through the thread's
+// ThreadLocalStoragePointer array (gs:[0x58]), indexed by the DWORD at AddressOfIndex. ntdll owns
+// that array: it sizes it, assigns the indexes, gives every thread a block per index and frees the
+// blocks. pe_map does not touch it. For an image with a non-empty template it writes a small
+// carrier DLL to a private directory under the temporary directory (see load_carrier) and loads
+// it with LoadLibraryExW. The carrier has no code
+// and imports nothing; it holds a TLS directory whose template is a copy of the guest's relocated template
+// and whose SizeOfZeroFill and Characteristics (alignment) are the guest's. Windows then assigns
+// the carrier a real index and allocates, aligns, initializes and frees one block per thread,
+// for threads that already exist and for threads created later, as it would for the guest.
+// pe_map stores the carrier's index at the guest's AddressOfIndex, so the guest's accesses land
+// in the carrier's blocks. FreeLibrary on the carrier returns the index and the blocks; the
+// carrier's file and directory are then deleted through the handles the map call holds.
+//
+// A process that ends with an image still mapped leaves its carrier directory behind, since
+// deletion is only requested on release. pe_map does not remove such directories: nothing but a
+// handle establishes that a carrier belongs to the caller.
+//
+// Differences from a Windows load of the guest: the template is copied once, when the image is
+// mapped, so a later write to the template in the image does not reach threads created afterwards;
+// and code that assumes index 0 without reading AddressOfIndex cannot be served.
+constexpr std::uint64_t MAX_TLS_TEMPLATE = 16ull << 20;
+
+// One map call's carrier and everything it owns. Nothing else is ever deleted: cleanup goes through
+// these handles, never through a name or a pattern.
+struct TlsCarrier {
+    HMODULE module = nullptr;
+    HANDLE file = INVALID_HANDLE_VALUE;       // read and delete access, shared for reading only
+    HANDLE directory = INVALID_HANDLE_VALUE;  // the private directory that holds the file
+};
+
+// Deletes the object behind handle. POSIX semantics remove the name when the handle closes, which
+// the directory needs: measured on Windows 10 build 19045, a carrier deleted with the classic
+// disposition after FreeLibrary sometimes stays listed after its last handle closes (1 of 10 runs),
+// and its directory then cannot be removed (ERROR_DIR_NOT_EMPTY). With POSIX semantics the name was
+// gone and the directory removed in 10 of 10 runs. File systems without them get the classic one.
+bool dispose(HANDLE handle) {
+    FILE_DISPOSITION_INFO_EX posix{FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS};
+    if (SetFileInformationByHandle(handle, FileDispositionInfoEx, &posix, sizeof(posix))) return true;
+    const DWORD error = GetLastError();
+    if (error != ERROR_INVALID_PARAMETER && error != ERROR_NOT_SUPPORTED && error != ERROR_INVALID_FUNCTION)
+        return false;
+    FILE_DISPOSITION_INFO classic{TRUE};
+    return SetFileInformationByHandle(handle, FileDispositionInfo, &classic, sizeof(classic)) != FALSE;
+}
+
+// Unloads the carrier, then deletes its file and its directory through the handles it holds.
+// Returns null, or the first cleanup step that failed with error holding GetLastError; whatever
+// could not be deleted stays where it is.
+const char* unload(TlsCarrier& carrier, DWORD& error) {
+    const char* failed = nullptr;
+    auto note = [&](const char* step) {
+        if (!failed) {
+            failed = step;
+            error = GetLastError();
+        }
+    };
+    if (carrier.module && !FreeLibrary(carrier.module)) note("cannot unload the TLS carrier");
+    if (carrier.file != INVALID_HANDLE_VALUE) {
+        if (!dispose(carrier.file)) note("cannot delete the TLS carrier file");
+        CloseHandle(carrier.file);
+    }
+    if (carrier.directory != INVALID_HANDLE_VALUE) {
+        if (!dispose(carrier.directory)) note("cannot remove the TLS carrier directory");
+        CloseHandle(carrier.directory);
+    }
+    carrier = TlsCarrier{};
+    return failed;
+}
+
+void unload(TlsCarrier& carrier) {
+    DWORD ignored = 0;
+    unload(carrier, ignored);
+}
+
+constexpr DWORD CARRIER_DATA_RVA = 0x1000, CARRIER_FILE_ALIGN = 0x200, CARRIER_PAGE = 0x1000;
+
+constexpr DWORD align_up(DWORD value, DWORD alignment) { return (value + alignment - 1) & ~(alignment - 1); }
+
+// The carrier's index slot holds this value until Windows assigns an index.
+constexpr DWORD CARRIER_NO_INDEX = 0xffffffff;
+
+// A relocatable PE32+ DLL with one data section (template, TLS directory, index, empty import
+// table) and a .reloc section for the directory's three addresses. It has no code and no entry
+// point. Measured on Windows 10 build 19045: a DLL without an import directory loads but is given
+// no TLS index, with or without an entry point; an import directory that holds only the null
+// descriptor is enough. index_rva receives the RVA of the carrier's TLS index.
+std::vector<std::uint8_t> carrier_image(const std::uint8_t* tls_template, std::size_t length, DWORD zero_fill,
+                                        DWORD characteristics, DWORD& index_rva) {
+    constexpr std::uint64_t preferred = 0x180000000ull;
+    // The directory is 40 bytes at a multiple of 64, so a page boundary never splits it.
+    const DWORD directory_offset = align_up(static_cast<DWORD>(length), 64);
+    const DWORD index_offset = directory_offset + sizeof(IMAGE_TLS_DIRECTORY64);
+    const DWORD import_offset = index_offset + 8;
+    const DWORD data_size = import_offset + align_up(static_cast<DWORD>(sizeof(IMAGE_IMPORT_DESCRIPTOR)), 8);
+    const DWORD data_raw = align_up(data_size, CARRIER_FILE_ALIGN);
+    const DWORD reloc_rva = align_up(CARRIER_DATA_RVA + data_size, CARRIER_PAGE);
+    const DWORD reloc_size = sizeof(IMAGE_BASE_RELOCATION) + 4 * sizeof(WORD);
+    const DWORD headers = CARRIER_FILE_ALIGN;
+    std::vector<std::uint8_t> file(std::size_t{headers} + data_raw + CARRIER_FILE_ALIGN);
+
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(file.data());
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = sizeof(IMAGE_DOS_HEADER);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(file.data() + dos->e_lfanew);
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    nt->FileHeader.NumberOfSections = 2;
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+    nt->FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE | IMAGE_FILE_DLL;
+    auto& opt = nt->OptionalHeader;
+    opt.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    opt.ImageBase = preferred;
+    opt.SectionAlignment = CARRIER_PAGE;
+    opt.FileAlignment = CARRIER_FILE_ALIGN;
+    opt.MajorOperatingSystemVersion = 6;
+    opt.MajorSubsystemVersion = 6;
+    opt.SizeOfInitializedData = data_raw + CARRIER_FILE_ALIGN;
+    opt.SizeOfImage = reloc_rva + CARRIER_PAGE;
+    opt.SizeOfHeaders = headers;
+    opt.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_GUI;
+    opt.DllCharacteristics = IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE | IMAGE_DLLCHARACTERISTICS_NX_COMPAT
+        | IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA;
+    opt.SizeOfStackReserve = 0x100000;
+    opt.SizeOfStackCommit = 0x1000;
+    opt.SizeOfHeapReserve = 0x100000;
+    opt.SizeOfHeapCommit = 0x1000;
+    opt.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS] = {CARRIER_DATA_RVA + directory_offset, sizeof(IMAGE_TLS_DIRECTORY64)};
+    opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {reloc_rva, reloc_size};
+    // The import table is only its null descriptor, which the zero-filled buffer already holds.
+    opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {CARRIER_DATA_RVA + import_offset, sizeof(IMAGE_IMPORT_DESCRIPTOR)};
+
+    auto* sections = IMAGE_FIRST_SECTION(nt);
+    std::memcpy(sections[0].Name, ".tls", 4);
+    sections[0].Misc.VirtualSize = data_size;
+    sections[0].VirtualAddress = CARRIER_DATA_RVA;
+    sections[0].SizeOfRawData = data_raw;
+    sections[0].PointerToRawData = headers;
+    sections[0].Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+    std::memcpy(sections[1].Name, ".reloc", 6);
+    sections[1].Misc.VirtualSize = reloc_size;
+    sections[1].VirtualAddress = reloc_rva;
+    sections[1].SizeOfRawData = CARRIER_FILE_ALIGN;
+    sections[1].PointerToRawData = headers + data_raw;
+    sections[1].Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE;
+
+    std::uint8_t* data = file.data() + headers;
+    if (length) std::memcpy(data, tls_template, length);
+    IMAGE_TLS_DIRECTORY64 tls{};
+    tls.StartAddressOfRawData = preferred + CARRIER_DATA_RVA;
+    tls.EndAddressOfRawData = tls.StartAddressOfRawData + length;
+    tls.AddressOfIndex = preferred + CARRIER_DATA_RVA + index_offset;
+    tls.SizeOfZeroFill = zero_fill;
+    tls.Characteristics = characteristics;
+    std::memcpy(data + directory_offset, &tls, sizeof(tls));
+    std::memcpy(data + index_offset, &CARRIER_NO_INDEX, sizeof(CARRIER_NO_INDEX));
+
+    // Base relocations for StartAddressOfRawData, EndAddressOfRawData and AddressOfIndex.
+    const DWORD directory_rva = CARRIER_DATA_RVA + directory_offset;
+    const IMAGE_BASE_RELOCATION block{directory_rva & ~(CARRIER_PAGE - 1), reloc_size};
+    WORD entries[4] = {};  // the fourth entry stays IMAGE_REL_BASED_ABSOLUTE padding
+    for (DWORD i = 0; i < 3; ++i)
+        entries[i] = static_cast<WORD>((IMAGE_REL_BASED_DIR64 << 12) | ((directory_rva + 8 * i) & (CARRIER_PAGE - 1)));
+    std::uint8_t* reloc = data + data_raw;
+    std::memcpy(reloc, &block, sizeof(block));
+    std::memcpy(reloc + sizeof(block), entries, sizeof(entries));
+
+    index_rva = CARRIER_DATA_RVA + index_offset;
+    return file;
+}
+
+constexpr wchar_t CARRIER_PREFIX[] = L"pe_map_tls_";
+
+// The identity of the file behind handle: volume serial number and 128-bit file ID.
+bool file_identity(HANDLE handle, FILE_ID_INFO& out) {
+    return GetFileInformationByHandleEx(handle, FileIdInfo, &out, sizeof(out)) != FALSE;
+}
+
+bool same_file(const FILE_ID_INFO& a, const FILE_ID_INFO& b) {
+    return a.VolumeSerialNumber == b.VolumeSerialNumber && std::memcmp(&a.FileId, &b.FileId, sizeof(a.FileId)) == 0;
+}
+
+// A protected DACL that grants full access to the process's user only, inherited by the carrier.
+bool private_descriptor(PSECURITY_DESCRIPTOR& descriptor) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    union {
+        TOKEN_USER user;
+        std::uint8_t bytes[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
+    } info;
+    DWORD size = 0;
+    const bool queried = GetTokenInformation(token, TokenUser, &info, sizeof(info), &size) != FALSE;
+    CloseHandle(token);
+    wchar_t* sid = nullptr;
+    if (!queried || !ConvertSidToStringSidW(info.user.User.Sid, &sid)) return false;
+    wchar_t sddl[32 + SECURITY_MAX_SID_SIZE * 4];
+    std::swprintf(sddl, sizeof(sddl) / sizeof(sddl[0]), L"D:P(A;OICI;FA;;;%ls)", sid);
+    LocalFree(sid);
+    return ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &descriptor, nullptr)
+        != FALSE;
+}
+
+// Writes the carrier into a directory of its own and loads it. The path must keep naming the file
+// this call wrote until the loader has opened it:
+// - The directory is new, under the temporary directory, with a 128-bit random name and a protected
+//   DACL for the process's user only. It is held open without delete sharing, so it cannot be
+//   renamed or removed. A reparse point in its place fails the map.
+// - The file is created there with CREATE_NEW, written, and identified by its file ID. The write
+//   handle has to be closed before the load, because the loader's open does not share writing.
+// - It is reopened for reading and deletion, shared for reading only, so from then on no one can
+//   write, rename or delete it. The reopened file must have the same ID, and its contents, read
+//   back through this handle, must be the bytes written.
+// - After the load, the file mapped as the carrier must be the file behind this handle.
+// Measured on Windows 10 build 19045: while those two handles are held, opening the file for
+// writing, renaming it, deleting it and renaming its directory fail with ERROR_SHARING_VIOLATION,
+// renaming the directory above fails with ERROR_ACCESS_DENIED, and LoadLibraryExW still loads it.
+// index receives the TLS index Windows assigned to the carrier. Returns null on success or the step
+// that failed; error then holds GetLastError. On failure this call deletes what it created and
+// still holds a handle to; nothing else is touched. If the carrier cannot be reopened, or the
+// directory cannot be queried, the file or directory is left where it is, since without a
+// verified handle this call cannot tell it is still its own.
+const char* load_carrier(const std::vector<std::uint8_t>& file, DWORD index_rva, TlsCarrier& carrier, DWORD& index,
+                         DWORD& error) {
+    auto failure = [&](const char* step, DWORD code) {
+        unload(carrier);
+        error = code;
+        return step;
+    };
+    wchar_t temporary[MAX_PATH + 1], directory[MAX_PATH + 1], path[MAX_PATH + 1];
+    DWORD length = GetTempPathW(MAX_PATH + 1, temporary);
+    if (length && length <= MAX_PATH) length = GetLongPathNameW(temporary, directory, MAX_PATH + 1);
+    if (!length || length > MAX_PATH)
+        return failure("cannot find the temporary directory for the TLS carrier", GetLastError());
+    std::uint8_t random[16];
+    const NTSTATUS generated = BCryptGenRandom(nullptr, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (generated != 0)  // error holds the NTSTATUS here
+        return failure("cannot generate a name for the TLS carrier", static_cast<DWORD>(generated));
+    wchar_t name[sizeof(random) * 2 + 1];
+    for (std::size_t i = 0; i < sizeof(random); ++i) std::swprintf(name + 2 * i, 3, L"%02x", random[i]);
+    // The directory name, a separator, the file name and ".dll" must fit.
+    constexpr std::size_t prefix = sizeof(CARRIER_PREFIX) / sizeof(CARRIER_PREFIX[0]) - 1;
+    if (length + 2 * (prefix + sizeof(random) * 2) + 5 > MAX_PATH)
+        return failure("the temporary directory path is too long for the TLS carrier", ERROR_FILENAME_EXCED_RANGE);
+    std::swprintf(path, MAX_PATH + 1, L"%ls%ls%ls", directory, CARRIER_PREFIX, name);
+    std::wcscpy(directory, path);
+
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (!private_descriptor(descriptor))
+        return failure("cannot build the access list of the TLS carrier directory", GetLastError());
+    SECURITY_ATTRIBUTES attributes{sizeof(attributes), descriptor, FALSE};
+    const BOOL created = CreateDirectoryW(directory, &attributes);
+    const DWORD create_error = GetLastError();
+    LocalFree(descriptor);
+    if (!created) return failure("cannot create the TLS carrier directory", create_error);
+    carrier.directory = CreateFileW(directory, DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                    nullptr);
+    if (carrier.directory == INVALID_HANDLE_VALUE)
+        return failure("cannot open the TLS carrier directory", GetLastError());
+    FILE_BASIC_INFO basic{};
+    if (!GetFileInformationByHandleEx(carrier.directory, FileBasicInfo, &basic, sizeof(basic))) {
+        const DWORD code = GetLastError();
+        CloseHandle(carrier.directory);  // unverified, so not removed
+        carrier.directory = INVALID_HANDLE_VALUE;
+        return failure("cannot query the TLS carrier directory", code);
+    }
+    if (!(basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        CloseHandle(carrier.directory);  // not the directory this call created, so not removed
+        carrier.directory = INVALID_HANDLE_VALUE;
+        return failure("the TLS carrier directory was replaced", ERROR_SUCCESS);
+    }
+
+    std::swprintf(path, MAX_PATH + 1, L"%ls\\%ls%ls.dll", directory, CARRIER_PREFIX, name);
+    HANDLE out = CreateFileW(path, GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW,
+                             FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (out == INVALID_HANDLE_VALUE) return failure("cannot create the TLS carrier file", GetLastError());
+    DWORD written = 0;
+    FILE_ID_INFO wrote{};
+    const bool ok = WriteFile(out, file.data(), static_cast<DWORD>(file.size()), &written, nullptr)
+        && written == file.size() && file_identity(out, wrote);
+    const DWORD write_error = GetLastError();
+    if (!ok) {
+        dispose(out);
+        CloseHandle(out);
+        return failure("cannot write the TLS carrier file", write_error);
+    }
+    CloseHandle(out);
+
+    // Opened before the load: the loader's own open shares reading and deletion, so this handle can
+    // be opened beside it, and it keeps any writer, rename or delete out until the carrier is unloaded.
+    HANDLE held = CreateFileW(path, GENERIC_READ | DELETE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (held == INVALID_HANDLE_VALUE) return failure("cannot reopen the TLS carrier file", GetLastError());
+    FILE_ID_INFO reopened{};
+    if (!file_identity(held, reopened) || !same_file(wrote, reopened)) {
+        const DWORD code = GetLastError();
+        CloseHandle(held);  // not the file this call wrote, so not deleted
+        return failure("the TLS carrier file was replaced before it was loaded", code);
+    }
+    carrier.file = held;
+    std::vector<std::uint8_t> check(file.size() + 1);
+    DWORD read = 0;
+    if (!ReadFile(carrier.file, check.data(), static_cast<DWORD>(check.size()), &read, nullptr))
+        return failure("cannot read back the TLS carrier file", GetLastError());
+    if (read != file.size() || std::memcmp(check.data(), file.data(), file.size()) != 0)
+        return failure("the TLS carrier file changed before it was loaded", ERROR_SUCCESS);
+
+    carrier.module = LoadLibraryExW(path, nullptr, 0);
+    if (!carrier.module) return failure("Windows cannot load the TLS carrier", GetLastError());
+    constexpr DWORD NAME = MAX_PATH + 64;
+    wchar_t mapped[NAME], held_name[NAME];
+    const DWORD mapped_length = GetMappedFileNameW(GetCurrentProcess(), carrier.module, mapped, NAME);
+    const DWORD held_length = GetFinalPathNameByHandleW(carrier.file, held_name, NAME, FILE_NAME_OPENED | VOLUME_NAME_NT);
+    if (!mapped_length || mapped_length >= NAME || !held_length || held_length >= NAME)
+        return failure("cannot name the file mapped as the TLS carrier", GetLastError());
+    if (CompareStringOrdinal(mapped, -1, held_name, -1, TRUE) != CSTR_EQUAL)
+        return failure("Windows mapped a different file as the TLS carrier", ERROR_SUCCESS);
+    std::memcpy(&index, reinterpret_cast<const std::uint8_t*>(carrier.module) + index_rva, sizeof(index));
+    if (index == CARRIER_NO_INDEX) return failure("Windows assigned no TLS index to the carrier", ERROR_SUCCESS);
+    return nullptr;
+}
+
 bool read_file(const wchar_t* path, std::vector<std::uint8_t>& raw) {
     HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
@@ -256,6 +585,7 @@ struct Mapped {
     std::uint8_t* base;
     volatile LONG references;
     volatile LONG released;  // set by pe_map_release; notifiers skip the image from then on
+    TlsCarrier carrier;      // holds the image's implicit TLS blocks; empty without a template
 };
 
 struct SharedLock {
@@ -293,18 +623,21 @@ void notify_mapped(std::uint8_t* base, DWORD reason) {
     notify(image, nt, callbacks, reason);
 }
 
-// Process detach, function-table removal and unmapping, once no reference remains.
-void finalize(std::uint8_t* base) {
+// Process detach, function-table removal, TLS release and unmapping, once no reference remains.
+// The TLS blocks outlive the detach notifications, as they do under FreeLibrary.
+void finalize(Mapped* record) {
+    std::uint8_t* base = record->base;
     const auto* nt = Image{base, 0}.headers();
     notify_mapped(base, DLL_PROCESS_DETACH);
     const auto& pdata = directory(nt, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
     if (pdata.Size) RtlDeleteFunctionTable(reinterpret_cast<PRUNTIME_FUNCTION>(base + pdata.VirtualAddress));
+    unload(record->carrier);
     VirtualFree(base, 0, MEM_RELEASE);
 }
 
 void drop_reference(Mapped* record) {
     if (InterlockedDecrement(&record->references) != 0) return;
-    finalize(record->base);
+    finalize(record);
     delete record;
 }
 
@@ -398,7 +731,13 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
     }
     if (!base) return fail(MAP_MEMORY, "cannot reserve image");
     const Image image{base, opt.SizeOfImage};
+    TlsCarrier carrier;
+    // A carrier that cannot be fully cleaned up is reported after the failure that caused the release.
     auto release = [&](void* result) {
+        DWORD error = 0;
+        const char* cleanup = unload(carrier, error);
+        const std::size_t used = cleanup && detail && capacity ? std::strlen(detail) : capacity;
+        if (used + 1 < capacity) std::snprintf(detail + used, capacity - used, "; %s (error %lu)", cleanup, error);
         VirtualFree(base, 0, MEM_RELEASE);
         return result;
     };
@@ -431,9 +770,9 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         std::memcpy(base + s.VirtualAddress, raw.data() + first, static_cast<std::size_t>(length));
     }
 
-    // TLS data needs a slot in each thread's ThreadLocalStoragePointer array, which ntdll owns.
-    // Only an empty template is accepted. Unlike Windows, which assigns an index even for an
-    // empty template, pe_map leaves AddressOfIndex as linked.
+    // A TLS data template is placed after the sections are protected, below. Unlike Windows,
+    // which assigns an index even for an empty template, pe_map leaves AddressOfIndex as linked
+    // when the template is empty and SizeOfZeroFill is zero.
     // Like the Windows loader, the TLS directory is found by its address alone; Size is not used.
     // Measured on Windows 11 build 26200: a TLS directory with Size 0, 1 or 39 still runs its
     // callback, one with address 0 is ignored whatever its Size, and one that does not fit in the
@@ -442,8 +781,6 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
     if (tls.VirtualAddress) {
         const auto* t = image.at<IMAGE_TLS_DIRECTORY64>(tls.VirtualAddress);
         if (!t) return release(fail(MAP_FORMAT, "TLS directory outside image"));
-        if (t->EndAddressOfRawData != t->StartAddressOfRawData || t->SizeOfZeroFill)
-            return release(fail(MAP_UNSUPPORTED, "TLS data"));
     }
 
     const auto& imports = directory(nt, IMAGE_DIRECTORY_ENTRY_IMPORT);
@@ -655,6 +992,48 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         const bool limit = reason == TOO_MANY_TLS_CALLBACKS;
         return release(fail(limit ? MAP_UNSUPPORTED : MAP_FORMAT, "%s", reason));
     }
+    // Implicit TLS data, before any guest code runs. tls_callbacks() has validated the directory
+    // and AddressOfIndex. Measured on Windows 10 build 19045 with tests/cpu/tls_data.cpp: a template
+    // that ends past the image fails the load with ERROR_NOACCESS and one that ends before its
+    // start with ERROR_BAD_EXE_FORMAT; a non-zero SizeOfZeroFill and every Characteristics value
+    // tried still load, so both fields are handed to Windows unchanged in the carrier.
+    if (tls.VirtualAddress) {
+        auto fail_tls = [&](MapStatus code, const char* reason) {
+            if (pdata.Size) RtlDeleteFunctionTable(image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress));
+            return release(fail(code, "%s", reason));
+        };
+        const auto* t = image.at<IMAGE_TLS_DIRECTORY64>(tls.VirtualAddress);
+        const auto address = reinterpret_cast<std::uint64_t>(base);
+        const std::uint64_t start = t->StartAddressOfRawData, end = t->EndAddressOfRawData;
+        const DWORD zero_fill = t->SizeOfZeroFill, characteristics = t->Characteristics;
+        const std::uint64_t index_va = t->AddressOfIndex;
+        if (end != start || zero_fill) {
+            if (end < start) return fail_tls(MAP_FORMAT, "TLS template ends before it starts");
+            // An empty template names no bytes, so its address is not checked: the linker may leave it 0.
+            if (end != start && (start < address || !inside(start - address, end - start, image.size)))
+                return fail_tls(MAP_FORMAT, "TLS template outside image");
+            if (end - start > MAX_TLS_TEMPLATE || zero_fill > MAX_TLS_TEMPLATE)
+                return fail_tls(MAP_UNSUPPORTED, "TLS template larger than 16 MiB");
+            const std::uint8_t* bytes = end != start ? base + (start - address) : base;
+            const auto length = static_cast<std::size_t>(end - start);
+            if (!readable(bytes, length)) return fail_tls(MAP_UNSUPPORTED, "TLS template not readable");
+            // The slot lies inside a writable section of the image, see tls_callbacks().
+            auto* slot = reinterpret_cast<std::uint8_t*>(index_va);
+            DWORD index_rva = 0, index = 0, error = 0;
+            const char* failed = nullptr;
+            try {
+                const auto file = carrier_image(bytes, length, zero_fill, characteristics, index_rva);
+                failed = load_carrier(file, index_rva, carrier, index, error);
+            } catch (const std::bad_alloc&) {
+                return fail_tls(MAP_MEMORY, "cannot allocate the TLS carrier");
+            }
+            if (failed) {
+                if (pdata.Size) RtlDeleteFunctionTable(image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress));
+                return release(fail(MAP_MEMORY, "%s (error %lu)", failed, error));
+            }
+            std::memcpy(slot, &index, sizeof(index));
+        }
+    }
     if (!notify(image, mapped_nt, callbacks, DLL_PROCESS_ATTACH)) {
         // Measured on Windows: a failed attach is followed by a full detach before the image is freed.
         // The callback list collected before attach is reused here; only pe_map_release re-reads it.
@@ -662,7 +1041,7 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         if (pdata.Size) RtlDeleteFunctionTable(image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress));
         return release(fail(MAP_INIT_FAILED, "entry point returned FALSE"));
     }
-    Mapped* record = new (std::nothrow) Mapped{base, 1, 0};
+    Mapped* record = new (std::nothrow) Mapped{base, 1, 0, carrier};
     bool registered = record != nullptr;
     if (record) {
         const ExclusiveLock hold;
@@ -678,6 +1057,7 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         if (pdata.Size) RtlDeleteFunctionTable(image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress));
         return release(fail(MAP_MEMORY, "cannot register image for thread notifications"));
     }
+    carrier = TlsCarrier{};  // owned by the record from here on
     return base;
 }
 

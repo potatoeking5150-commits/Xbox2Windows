@@ -21,7 +21,7 @@ J = 1 << 63
 # Mutations of the lifted source that the check requires to mismatch: (pattern, replacement).
 CONTROLS = {
     "normal": (re.compile(re.escape("return x87_exp(v) == 0 ? 0x4400 : 0x0400;")), "return 0x0400;"),
-    "unsigned": (re.compile(r"static_cast<int(16|32)_t>\(load<uint(16|32)_t>"), r"static_cast<uint\1_t>(load<uint\2_t>"),
+    "unsigned": (re.compile(r"static_cast<int(16|32)_t>\(load_always<uint\1_t>"), r"static_cast<uint\1_t>(load_always<uint\1_t>"),
     "positive": (re.compile(re.escape("x87_compare(x87_slot[0], X87Value{0, 0})")),
                  "x87_compare(x87_slot[0], X87Value{0x8000000000000000ull, 0x3fff})"),
 }

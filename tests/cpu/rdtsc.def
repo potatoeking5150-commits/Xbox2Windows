@@ -1,0 +1,4 @@
+EXPORTS
+    rdtsc_op
+    rdtsc_twice
+    rdtsc_unused

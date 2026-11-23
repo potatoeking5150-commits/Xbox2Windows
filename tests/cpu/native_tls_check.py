@@ -201,7 +201,6 @@ def check_rejections(image, sink_path, mapper_path):
         data_unreadable = data.Characteristics & no_access
         callbacks_unreadable = callback_section.Characteristics & no_access
     controls = (
-        ("<I", zero_fill, 16, "unsupported", "TLS data", False),
         ("<I", entry, data.VirtualAddress, "format", "entry point outside executable section", False),
         ("<Q", first_callback, data_va, "format", "TLS callback outside executable section", True),
         # Section protections are applied before the TLS directory and list are read.
@@ -226,43 +225,47 @@ def check_rejections(image, sink_path, mapper_path):
             raise AssertionError(f"{message} control: {base=} {status=} {detail=} {requests=}")
         if calls(sink):
             raise AssertionError(f"{message} control: notifications were sent: {calls(sink)}")
-    print("rejected without notifications: a TLS zero-fill size, an entry point in .data, a TLS callback "
+    print("rejected without notifications: an entry point in .data, a TLS callback "
           "pointing into .data, an unreadable TLS directory, an unreadable callback list, a TLS "
           "index past the image and a TLS index in read-only .rdata")
 
-    # A valid alternate writable slot (even unaligned) loads under both loaders with the
-    # usual notifications: measured on Windows 11, .data+4 runs the callback and the entry
-    # point. This guards the new index check against false rejections.
-    alternate = data_va + 4
-    copy = bytearray(Path(image).read_bytes())
-    struct.pack_into("<Q", copy, index, alternate)
-    sink.sink_clear()
-    with TemporaryDirectory() as temp:
-        moved = Path(temp) / Path(image).name
-        moved.write_bytes(copy)
-        shutil.copy(sink_path, Path(temp) / Path(sink_path).name)
-        loader = ctypes.WinDLL("kernel32", use_last_error=True)
-        loader.LoadLibraryExW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32]
-        loader.LoadLibraryExW.restype = ctypes.c_void_p
-        loader.FreeLibrary.argtypes = [ctypes.c_void_p]
-        altered = loader.LoadLibraryExW(str(moved), None, 0x8)
-        native_attach = calls(sink)
-        if altered:
-            loader.FreeLibrary(altered)
-        # sink_read does not consume: clear the native attach/detach before mapping.
-        sink.sink_clear()
-        base, status, detail, _ = mapper(moved, {Path(sink_path).name.casefold(): sink})
-        mapped_attach = calls(sink, base) if base else None
-        if base:
-            mapper.release(base)
+    # Copies both loaders accept, with the usual notifications.
+    # - A valid alternate writable slot (even unaligned): measured on Windows 11, .data+4 runs the
+    #   callback and the entry point. This guards the index check against false rejections.
+    # - A zero-fill size on the empty template: measured on Windows 10 build 19045, the copy loads.
+    #   pe_map hands the size to Windows in the TLS carrier (tools/pe_map.cpp).
+    loader = ctypes.WinDLL("kernel32", use_last_error=True)
+    loader.LoadLibraryExW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32]
+    loader.LoadLibraryExW.restype = ctypes.c_void_p
+    loader.FreeLibrary.argtypes = [ctypes.c_void_p]
     expected = [[TLS, ATTACH, "module", 0], [ENTRY, ATTACH, "module", 0]]
-    if not altered or native_attach != expected:
-        raise AssertionError(f"alternate writable TLS index: native={bool(altered)} {native_attach}")
-    if not base or status != STATUS["ok"] or mapped_attach != expected:
-        raise AssertionError(
-            f"alternate writable TLS index: mapped={base} {status} {detail} {mapped_attach}")
-    print("alternate writable TLS index (.data+4, unaligned): Windows and pe_map run the TLS "
-          "callback and the entry point")
+    accepted = (
+        ("alternate writable TLS index (.data+4, unaligned)", "<Q", index, data_va + 4),
+        ("TLS zero-fill size 16 on an empty template", "<I", zero_fill, 16),
+    )
+    for label, layout, offset, value in accepted:
+        copy = bytearray(Path(image).read_bytes())
+        struct.pack_into(layout, copy, offset, value)
+        sink.sink_clear()
+        with TemporaryDirectory() as temp:
+            moved = Path(temp) / Path(image).name
+            moved.write_bytes(copy)
+            shutil.copy(sink_path, Path(temp) / Path(sink_path).name)
+            altered = loader.LoadLibraryExW(str(moved), None, 0x8)
+            native_attach = calls(sink)
+            if altered:
+                loader.FreeLibrary(altered)
+            # sink_read does not consume: clear the native attach/detach before mapping.
+            sink.sink_clear()
+            base, status, detail, _ = mapper(moved, {Path(sink_path).name.casefold(): sink})
+            mapped_attach = calls(sink, base) if base else None
+            if base:
+                mapper.release(base)
+        if not altered or native_attach != expected:
+            raise AssertionError(f"{label}: native={bool(altered)} {native_attach}")
+        if not base or status != STATUS["ok"] or mapped_attach != expected:
+            raise AssertionError(f"{label}: mapped={base} {status} {detail} {mapped_attach}")
+        print(f"{label}: Windows and pe_map run the TLS callback and the entry point")
 
     # LoadLibrary sends nothing to a non-DLL image (for an EXE the entry point is the program).
     # Clearing IMAGE_FILE_DLL must leave both the TLS callback and the entry point silent.

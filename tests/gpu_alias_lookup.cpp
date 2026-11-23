@@ -10,6 +10,8 @@
 #include "era_title_va.h"
 #include "LookupTitleAddresses.h"
 #include "ProbeArrayAtomics.h"
+#include "ProbeArrayAtomicsWaterfall.h"
+#include "ProbeArrayAtomicsReturns.h"
 #include "WriteTitleAddresses.h"
 
 #include <algorithm>
@@ -194,10 +196,10 @@ Word float_bits(float value)
 // aliases under test. 256 threads each add 1 to word 0 of one of four zeroed buffers, 64 threads
 // per buffer. Prints the expected and actual counts. The in-box WARP of Windows 10 (10.0.19041)
 // applies each such add four times, which is a wrong result, not a missing capability.
-bool array_atomics_exact(ID3D12Device* device)
+bool array_atomics_exact(ID3D12Device* device, D3D12_SHADER_BYTECODE shader, const char* name)
 {
     constexpr UINT targets = 4, threads = 256;
-    Kernel kernel(device, {ProbeArrayAtomics, sizeof(ProbeArrayAtomics)});
+    Kernel kernel(device, shader);
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, descriptor_count,
                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     ComPtr<ID3D12DescriptorHeap> heap;
@@ -242,12 +244,128 @@ bool array_atomics_exact(ID3D12Device* device)
     cmd.submit_and_wait(device);
     const auto counts = read(back.Get(), targets);
     const Word expected = threads / targets;
-    std::printf("array_atomics threads=%u buffers=%u expected=%u actual=%u,%u,%u,%u\n", threads, targets, expected,
+    std::printf("%s threads=%u buffers=%u expected=%u actual=%u,%u,%u,%u\n", name, threads, targets, expected,
                 counts[0], counts[1], counts[2], counts[3]);
     return std::all_of(counts.begin(), counts.end(), [=](Word count) { return count == expected; });
 }
 }
+bool check_gpu_alias_atomic_waterfall(ID3D12Device* device)
+{
+    return array_atomics_exact(device, {ProbeArrayAtomicsWaterfall, sizeof(ProbeArrayAtomicsWaterfall)},
+                               "array_atomics_waterfall");
+}
+bool check_gpu_alias_atomic_returns(ID3D12Device* device)
+{
+    constexpr UINT targets = 4, threads = 256;
+    Kernel kernel(device, {ProbeArrayAtomicsReturns, sizeof(ProbeArrayAtomicsReturns)});
 
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, descriptor_count,
+        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0
+    };
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)),
+          "Create atomic return probe descriptor heap");
+
+    const UINT stride =
+        device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    std::array<ComPtr<ID3D12Resource>, targets> buffers;
+    auto results = make_buffer(device, threads * sizeof(Word),
+                               D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
+                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+    for (UINT i = 0; i < targets; ++i)
+        buffers[i] = make_buffer(device, sizeof(Word), D3D12_HEAP_TYPE_DEFAULT,
+                                 D3D12_RESOURCE_STATE_COMMON,
+                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+    for (UINT slot = 0; slot < descriptor_count; ++slot) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        view.Buffer.NumElements = slot == 4 ? threads : 1;
+
+        ID3D12Resource* resource = nullptr;
+        if (slot < targets) resource = buffers[slot].Get();
+        else if (slot == 4) resource = results.Get();
+
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += static_cast<SIZE_T>(slot) * stride;
+        device->CreateUnorderedAccessView(resource, nullptr, &view, cpu);
+    }
+
+    auto zero = upload(device, std::vector<Word>(1, 0));
+    auto count_back = make_buffer(device, targets * sizeof(Word),
+                                  D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    auto values_back = make_buffer(device, threads * sizeof(Word),
+                                   D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    ComputeCommands cmd(device, kernel.pipeline.Get());
+    auto* list = cmd.list.Get();
+
+    for (auto& buffer : buffers) {
+    transition(list, buffer.Get(), D3D12_RESOURCE_STATE_COMMON,
+               D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyBufferRegion(buffer.Get(), 0, zero.Get(), 0, sizeof(Word));
+    transition(list, buffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+    transition(list, results.Get(), D3D12_RESOURCE_STATE_COMMON,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    ID3D12DescriptorHeap* heaps[] = {heap.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(kernel.root.Get());
+    list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    list->SetComputeRoot32BitConstant(1, targets, 0);
+    list->SetComputeRoot32BitConstant(1, threads, 1);
+    list->Dispatch(threads / 64, 1, 1);
+
+    for (UINT i = 0; i < targets; ++i) {
+        transition(list, buffers[i].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(count_back.Get(), i * sizeof(Word),
+                               buffers[i].Get(), 0, sizeof(Word));
+    }
+    transition(list, results.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(values_back.Get(), 0, results.Get(), 0,
+                           threads * sizeof(Word));
+
+    cmd.submit_and_wait(device);
+
+    const auto counts = read(count_back.Get(), targets);
+    const auto values = read(values_back.Get(), threads);
+
+    std::array<std::array<bool, 64>, targets> seen{};
+    bool valid = true;
+
+    for (UINT i = 0; i < targets; ++i)
+        valid = valid && counts[i] == 64;
+
+    for (UINT id = 0; id < threads; ++id) {
+        const UINT buffer = id % targets;
+        const Word value = values[id];
+
+        if (value >= 64 || seen[buffer][value]) {
+            valid = false;
+            continue;
+        }
+        seen[buffer][value] = true;
+    }
+
+    for (const auto& buffer_seen : seen)
+        for (bool found : buffer_seen)
+            valid = valid && found;
+
+    std::printf("array_atomics_returns counters=%u,%u,%u,%u return_values=%s\n",
+                counts[0], counts[1], counts[2], counts[3],
+                valid ? "PASS" : "FAIL");
+
+    return valid;
+}
 bool check_gpu_alias_lookup(ID3D12Device* device)
 {
     AliasFixture fixture;
@@ -312,7 +430,8 @@ bool check_gpu_alias_lookup_writes(ID3D12Device* device)
     if (!fixture.open(device)) return false;
     // Measured first and always printed. Wrong counts fail the test at the end, after the whole
     // fixture has run, so the output separates the add and sub words from every other check.
-    const bool atomics_exact = array_atomics_exact(device);
+    const bool atomics_exact = array_atomics_exact(device, {ProbeArrayAtomics, sizeof(ProbeArrayAtomics)},
+                                                   "array_atomics");
     enum : Word { Store = 0, Add = 1, Sub = 2, MinFloat = 3, MaxFloat = 4 };
     struct Record {
         std::uint64_t address;

@@ -1,0 +1,46 @@
+OpCapability Shader
+OpCapability MinLod
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %texture %sampler %color
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %texture DescriptorSet 0
+OpDecorate %texture Binding 0
+OpDecorate %sampler DescriptorSet 0
+OpDecorate %sampler Binding 0
+OpDecorate %color Location 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v2 = OpTypeVector %float 2
+%v4 = OpTypeVector %float 4
+%int = OpTypeInt 32 1
+%iv2 = OpTypeVector %int 2
+%image = OpTypeImage %float 2D 0 0 0 1 Unknown
+%samplertype = OpTypeSampler
+%sampledimage = OpTypeSampledImage %image
+%imageptr = OpTypePointer UniformConstant %image
+%samplerptr = OpTypePointer UniformConstant %samplertype
+%outputptr = OpTypePointer Output %v4
+%texture = OpVariable %imageptr UniformConstant
+%sampler = OpVariable %samplerptr UniformConstant
+%color = OpVariable %outputptr Output
+%zero = OpConstant %float 0
+%one = OpConstant %float 1
+%quarter = OpConstant %float 0.25
+%step = OpConstant %float 0.03125
+%bias = OpConstant %float -0.5
+%uv = OpConstantComposite %v2 %quarter %quarter
+%dx = OpConstantComposite %v2 %step %zero
+%dy = OpConstantComposite %v2 %zero %step
+%ix = OpConstant %int 1
+%iy = OpConstant %int 0
+%offset = OpConstantComposite %iv2 %ix %iy
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%t = OpLoad %image %texture
+%s = OpLoad %samplertype %sampler
+%sampled = OpSampledImage %sampledimage %t %s
+%value = @sample@
+OpStore %color %value
+OpReturn
+OpFunctionEnd

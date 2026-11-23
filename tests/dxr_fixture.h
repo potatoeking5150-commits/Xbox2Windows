@@ -24,11 +24,12 @@ struct Capabilities {
 Capabilities capabilities(ID3D12Device* device);
 bool supported(ID3D12Device* device, Backend backend = Backend::inline_query);
 D3D12_RAYTRACING_INSTANCE_DESC instance(UINT id, UINT mask, float translateX = 0);
-// The pipeline backend uses one static opaque geometry, hit group 0 and unflagged rays.
+// The pipeline backend uses instance hit-group offset 0. With one opaque
+// geometry it supports facing readback and at most one face-cull flag.
 std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Vertex>& vertices,
     std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances, const std::vector<Ray>& rays,
     Backend backend = Backend::inline_query, const SceneUpdate* update = nullptr,
     // When set, each triangle becomes its own geometry with these flags and
-    // ray_candidates.hlsl traces the rays.
+    // ray_candidates.hlsl traces the opacity probes on either backend.
     const std::vector<D3D12_RAYTRACING_GEOMETRY_FLAGS>* triangleGeometries = nullptr);
 }

@@ -38,9 +38,10 @@ CONTROLS = {
     "jrcxz": (re.compile(r"== 0\) goto"), "!= 0) goto"),
 }
 
-# Runs of equal and unequal bytes. The final 0 ends every scan, even in a control that skips the zero-count
-# guard, before it can leave the buffer.
-SCAN = bytes([7] * 12 + [3] + [7] * 5 + [9, 9, 9, 7, 7, 7] + list(range(40, 80)) + [0])
+# These values are the low bytes of every scan needle. The tail gives a
+# zero-count-guard mutant both a matching and a differing byte for each needle.
+SCAN_VALUES = (7, 3, 9, 0, 45)
+SCAN = bytes([7] * 12 + [3] + [7] * 5 + [9, 9, 9, 7, 7, 7] + list(range(40, 80)) + [0] + list(SCAN_VALUES))
 PRESETS = (0, 1, 1 << 63, 3 << 62)  # add r8, r8: (ZF, CF) = (1, 0), (0, 0), (1, 1), (0, 1)
 UPPER = (0, 0xabcd, MASK32)
 
@@ -125,7 +126,7 @@ def cases():
             for upper in (UPPER if ecx else (0,)):
                 for n in range(0, 25):
                     for offset in (0, 10, 12, 13, 18, 21, 24):
-                        for value in (7, 3, 9, 0, 45):
+                        for value in SCAN_VALUES:
                             yield name, (upper << 32 | n, offset, value)
 
 

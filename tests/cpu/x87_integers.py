@@ -58,7 +58,7 @@ CONTROLS = {
     "nanzero": (re.compile(r"if \(x87_unsupported\(v\) \|\| x87_exp\(v\) == 0x7fff\) return indefinite;"),
                 "if (x87_is_nan(v)) return 0; if (x87_unsupported(v) || x87_exp(v) == 0x7fff) return indefinite;"),
     # FILD m16 and m32 zero-extend instead of sign-extending.
-    "zext": (re.compile(r"static_cast<int(16|32)_t>\(load<uint\1_t>\(a\)\)"), r"static_cast<int64_t>(load<uint\1_t>(a))"),
+    "zext": (re.compile(r"static_cast<int(16|32)_t>\((load(?:_always)?)<uint\1_t>\(a\)\)"), r"static_cast<int64_t>(\2<uint\1_t>(a))"),
     # FILD keeps only 53 significand bits, as if the precision control applied to it.
     "fild53": (re.compile(r"return \{magnitude << shift, "), "return {(magnitude << shift) & ~0x7ffull, "),
 }

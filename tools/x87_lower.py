@@ -555,10 +555,16 @@ def check_flags(body, exits):
                                  f"{i.ip:#x} -> {target:#x}")
 
 
-def statement(i, depth, address, checked=None, parity=False):
+def statement(i, depth, address, checked=None, parity=False, read="load"):
     """C++ for one profile instruction at a known stack depth; address() gives the memory operand. checked
     is the Checked entry's error channel, or None for the fixed control word. parity is whether the function
-    declares the integer lowering's PF, which the FCOMI family then sets."""
+    declares the integer lowering's PF, which the FCOMI family then sets. read names the template that reads
+    a memory operand: the integer lowering passes load_always for guest memory, which the compiler must read
+    even when the value is unused, and load for the function's own frame."""
+    return _statement(i, depth, address, checked, parity).replace("load<", f"{read}<")
+
+
+def _statement(i, depth, address, checked, parity):
     op = i.mnemonic
     _effect(i, depth, checked)
     top = depth - 1  # ST(k) is x87_slot[top - k]

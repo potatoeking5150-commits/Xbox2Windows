@@ -14,6 +14,6 @@ with tempfile.TemporaryDirectory() as folder:
     subprocess.run([sys.executable, "-B", root / "tools/spirv_address_window.py",
                     Path(__file__).with_name("subtract.spvasm"), module,
                     "--assembler", assembler, "--validator", validator], check=True)
-    subprocess.run([cross, module, "--hlsl", "--shader-model", "66", "--output", hlsl], check=True)
-    subprocess.run([dxc, "-T", "cs_6_6", "-E", "main", "-Fo", dxil, hlsl], check=True)
+    subprocess.run([cross, module, "--hlsl", "--shader-model", "60", "--output", hlsl], check=True)
+    subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", dxil, hlsl], check=True)
     sys.exit(subprocess.run([renderer, adapter, "--spirv-address-window", dxil]).returncode)

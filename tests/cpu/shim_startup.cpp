@@ -60,7 +60,8 @@ bool check_working_set()
     output.fill(sentinel);
     const auto expected = output;
     SetLastError(ERROR_SUCCESS);
-    const BOOL ok = XMemGetWorkingSetStatistics(0x20000001, output.data());
+    // 0x20000001, the selector the AMD callers pass, is supported; other selectors are not.
+    const BOOL ok = XMemGetWorkingSetStatistics(0x20000002, output.data());
     const DWORD error = GetLastError();
     return !ok && error == ERROR_NOT_SUPPORTED && output == expected;
 }

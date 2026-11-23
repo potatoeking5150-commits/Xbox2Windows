@@ -20,7 +20,7 @@ EXPERIMENTS = {
     ("xmem.dll", "XMemAlloc"): "era_heap_allocation, era_heap_failure, era_heap_concurrency, era_heap_observed_words, era_heap_large_alignment, xmem_shim_allocation",
     ("xmem.dll", "XMemFree"): "era_heap_allocation, era_heap_concurrency, era_heap_observed_words, era_heap_large_alignment, xmem_shim_allocation",
     ("xmem.dll", "XMemVirtualQuery"): "desktop_memory_query, era_query_fields, era_query_tail, xmem_shim_query: Windows page states; tail byte is a desktop policy; Scarlett ABI unverified",
-    ("xmem.dll", "XMemGetWorkingSetStatistics"): "desktop_memory_query, xmem_shim_working_set: desktop xmem.dll reports unsupported; Scarlett scope and units unverified",
+    ("xmem.dll", "XMemGetWorkingSetStatistics"): "desktop_memory_query, xmem_shim_working_set_*: desktop xmem.dll returns DXGI GPU memory usage in bytes for selector 0x20000001; Scarlett scope unverified",
     ("d3d12_xs.dll", "D3D12SerializeVersionedRootSignature"): "desktop_root_signature",
     ("d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer"): "desktop_root_signature",
 }

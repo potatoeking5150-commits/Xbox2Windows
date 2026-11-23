@@ -5,8 +5,12 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 
-from mesh_textured_check import (HEADER, PALETTE, POSITIONS, WORDS, enumerate_pcs, fixture,
-                                 lower, lower_pixel, lod_zero_sample, mesh_program, texture_case)
+from mesh_fallback_check import compile_fallback, fallback_fixture
+from mesh_textured_check import (
+    HEADER, PALETTE, PIXEL_CBV_OFFSETS, PIXEL_CBV_WORDS, POSITIONS, VERTEX_ORDER, WORDS,
+    enumerate_pcs, fallback_pixel_source, fixture, lower, mesh_program, pixel_source, texture_case,
+    vertex_attributes,
+)
 from compute_store_aot import lower as lower_compute
 from pixel_aot_check import compile_shader
 
@@ -22,15 +26,31 @@ def producer(texels):
     return lower_compute(code, 1, table_reg=8, descriptor_offset=0)
 
 
-def check(tmp, compiler, renderer, adapter):
+def compile_native(tmp, compiler):
     mesh_source, mesh = tmp / "mesh.hlsl", tmp / "mesh.dxil"
     mesh_source.write_text(lower(enumerate_pcs(mesh_program()), WORDS, (3, 1), HEADER), encoding="ascii")
     subprocess.run([compiler, "-T", "ms_6_5", "-E", "main", "-DTRACE_EXPORTS",
                     "-Fo", mesh, mesh_source], check=True)
-    pixel_source, pixel = tmp / "pixel.hlsl", tmp / "pixel.dxil"
-    pixel_source.write_text(lower_pixel(lod_zero_sample(), 20, 24, [1, 2, 3, 4], texcoord_components=4),
-                            encoding="ascii")
-    compile_shader(compiler, pixel_source, pixel)
+    pixel_hlsl, pixel = tmp / "pixel.hlsl", tmp / "pixel.dxil"
+    pixel_hlsl.write_text(pixel_source(), encoding="ascii")
+    compile_shader(compiler, pixel_hlsl, pixel)
+    return mesh, pixel
+
+
+def fallback_reference(data, pixels):
+    for offset, word in zip(PIXEL_CBV_OFFSETS, PIXEL_CBV_WORDS, strict=True):
+        struct.pack_into("<I", data, offset, word)
+    attributes = vertex_attributes(False)
+    return fallback_fixture(data, POSITIONS, pixels, [attributes[i] for i in VERTEX_ORDER])
+
+
+def check(tmp, compiler, renderer, adapter, *, fallback=False):
+    if fallback:
+        draw_shaders = compile_fallback(compiler, tmp, mesh_program(), fallback_pixel_source())
+        operation = "--compute-mesh-texture-fallback"
+    else:
+        draw_shaders = compile_native(tmp, compiler)
+        operation = "--compute-mesh-texture"
 
     shaders = []
     for i, palette in enumerate((PALETTE, PALETTE[1:] + PALETTE[:1])):
@@ -39,25 +59,28 @@ def check(tmp, compiler, renderer, adapter):
         source.write_text(producer(texels), encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", shader, source], check=True)
         # The case file carries geometry and the final reference, with no texture upload payload.
-        reference.write_bytes(fixture(data, POSITIONS, pixels, True))
+        expected = fallback_reference(data, pixels) if fallback else fixture(data, POSITIONS, pixels, True)
+        reference.write_bytes(expected)
         shaders.append(shader)
-        command = [renderer, adapter, "--compute-mesh-texture", mesh, pixel, reference, *shaders]
+        command = [renderer, adapter, operation, *draw_shaders, reference, *shaders]
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode == 77:
             print(result.stdout, end="")
             return 77
-        verify(result, count=i + 1, selected=i)
+        verify(result, count=i + 1, selected=i, fallback=fallback)
 
     stale = subprocess.run([*command, "--stale"], capture_output=True, text=True)
-    verify(stale, count=2, selected=0, stale=True)
+    verify(stale, count=2, selected=0, fallback=fallback, stale=True)
     print("Both GPU-produced palettes matched; the stale SRV differed at 276 pixels.")
     return 0
 
 
-def verify(result, *, count, selected, stale=False):
+def verify(result, *, count, selected, fallback, stale=False):
     lines = result.stdout.splitlines()
     expected = (f"texture_producers={count} bound_texture={selected}",
                 f"pixels=1024 mismatches={276 if stale else 0}")
+    if fallback:
+        expected += ("mesh_exports bytes=128 matched=1",)
     if (result.returncode != int(stale) or any(line not in lines for line in expected)
             or (stale and "Draw reference mismatch" not in result.stderr.splitlines())
             or ("debug_layer=enabled" in result.stdout and "debug_errors=0 debug_warnings=0" not in lines)):
@@ -67,4 +90,6 @@ def verify(result, *, count, selected, stale=False):
 
 if __name__ == "__main__":
     with TemporaryDirectory() as directory:
-        sys.exit(check(Path(directory), *sys.argv[1:]))
+        args = sys.argv[1:]
+        fallback = args[0] == "fallback"
+        sys.exit(check(Path(directory), *(args[1:] if fallback else args), fallback=fallback))

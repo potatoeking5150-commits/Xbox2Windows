@@ -35,9 +35,11 @@ for t in \
   tests/script_state_check.py \
   tests/resource_root_check.py \
   tests/bcpack_check.py \
+  tests/bcpack_symbols_check.py \
   tests/bc7_blocks_check.py \
   tests/bc7_tiles_check.py \
   tests/resource_ranges_check.py \
+  tests/ttpf_batch_export_check.py \
   tests/awc_metadata_check.py \
   tests/sgd5_effects_check.py \
   tests/dxcontainer_part_offsets_check.py \
@@ -45,6 +47,7 @@ for t in \
   tests/dependency_paths_check.py \
   tests/intake/paths_check.py \
   tests/shader_probe_check.py \
+  tests/shader_census_check.py \
   tests/dxil_retarget_check.py \
   tests/rdna2_tools_check.py \
   tests/pso_readiness_check.py \
@@ -92,10 +95,12 @@ for t in \
   tests/script_state_check.py \
   tests/resource_root_check.py \
   tests/bcpack_check.py \
+  tests/bcpack_symbols_check.py \
   tests/bc7_blocks_check.py \
   tests/bc7_tiles_check.py \
   tests/form_coverage_check.py \
   tests/resource_ranges_check.py \
+  tests/ttpf_batch_export_check.py \
   tests/awc_metadata_check.py \
   tests/sgd5_effects_check.py \
   tests/dxcontainer_part_offsets_check.py \
@@ -103,6 +108,7 @@ for t in \
   tests/dependency_paths_check.py \
   tests/intake/paths_check.py \
   tests/shader_probe_check.py \
+  tests/shader_census_check.py \
   tests/dxil_retarget_check.py \
   tests/rdna2_tools_check.py \
   tests/pso_readiness_check.py \

@@ -1,0 +1,5 @@
+EXPORTS
+    has_rdrand
+    has_rdseed
+    rdrand_rflags
+    rdseed_rflags

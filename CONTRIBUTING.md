@@ -4,6 +4,10 @@ You can contribute a hardware result, a source-built failing case, a documentati
 
 Visit [GitHub Discussions](https://github.com/R0Y00/Xbox2Windows/discussions) and follow the [pinned newcomer guide](https://github.com/R0Y00/Xbox2Windows/discussions/75) to get started. For build or debugging help, post the commit, command and observed result in [Development Q&A](https://github.com/R0Y00/Xbox2Windows/discussions/categories/development-q-a).
 
+Use [Xbox2Windows Dev on Discord](https://discord.gg/DMcmNtpd6R) to ask quick questions, find a reviewer or coordinate an independent test. Record claims, reproduction evidence, review conclusions and technical decisions in the corresponding GitHub issue or PR.
+
+Keep public project wording title-neutral. Refer to the platform, component or fixture when describing a result.
+
 ## Find and claim a task
 
 1. Search the [issue tracker](https://github.com/R0Y00/Xbox2Windows/issues) for the test name or observed behavior. Issues labeled **good first issue** have a small first step. **help wanted** marks work that can proceed independently.

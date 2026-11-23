@@ -1,0 +1,3 @@
+EXPORTS
+    serial_tsc
+    has_rdtscp

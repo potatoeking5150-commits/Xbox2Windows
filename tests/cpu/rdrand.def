@@ -1,0 +1,5 @@
+EXPORTS
+    rdrand_16
+    rdrand_32
+    rdrand_64
+    rdrand_unused

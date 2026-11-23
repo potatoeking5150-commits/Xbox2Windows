@@ -29,7 +29,7 @@ CONTROLS = {
     # The 67h sum keeps the upper half of RBX. Those reads fault, and a fault counts as a mismatch.
     "noaddr32": (re.compile(r"static_cast<uint32_t>\((rbx \+ static_cast<uint8_t>\(rax\))\)"), r"(\1)"),
     # The loaded byte replaces all of RAX.
-    "clear": (re.compile(r"rax = \(rax & ~0xffull\) \| load<uint8_t>"), "rax = load<uint8_t>"),
+    "clear": (re.compile(r"rax = \(rax & ~0xffull\) \| load_always<uint8_t>"), "rax = load_always<uint8_t>"),
 }
 
 PAGE = 0x1000

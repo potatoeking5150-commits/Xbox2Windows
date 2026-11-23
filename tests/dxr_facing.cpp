@@ -9,7 +9,7 @@ static_assert(dxr_facing::cullBack == D3D12_RAY_FLAG_CULL_BACK_FACING_TRIANGLES)
 static_assert(dxr_facing::cullFront == D3D12_RAY_FLAG_CULL_FRONT_FACING_TRIANGLES);
 
 namespace {
-void check_shared_edge(ID3D12Device* device, bool supported) {
+void check_shared_edge(ID3D12Device* device, dxr_fixture::Backend backend, bool supported) {
     const std::vector<dxr_facing::Vertex> mesh{
         {0,0,1}, {0,1,1}, {1,0,1}, {1,0,1}, {0,1,1}, {1,1,1}};
     const auto identity = dxr_facing::instances().front();
@@ -37,7 +37,7 @@ void check_shared_edge(ID3D12Device* device, bool supported) {
         }
     }
     if (!supported) return;
-    const auto words = dxr_fixture::trace(device, mesh, {dxr_fixture::instance(identity.id, 255)}, rays);
+    const auto words = dxr_fixture::trace(device, mesh, {dxr_fixture::instance(identity.id, 255)}, rays, backend);
     UINT edgeOwners[2]{}, interiorHits = 0, misses = 0;
     for (std::size_t i = 0; i < rays.size(); ++i) {
         const UINT allowed = probes[i % std::size(probes)].allowed;
@@ -62,7 +62,7 @@ void check_shared_edge(ID3D12Device* device, bool supported) {
 }
 }
 
-bool check_dxr_facing(ID3D12Device* device) {
+bool check_dxr_facing(ID3D12Device* device, bool usePipeline) {
     // The geometric reference must reproduce the hand-derived table on every
     // machine, including those that skip the GPU comparison.
     const auto scene = dxr_facing::instances();
@@ -78,8 +78,9 @@ bool check_dxr_facing(ID3D12Device* device) {
     }
     if (dxr_facing::first_reference_mismatch() != probes.size())
         throw std::runtime_error("Facing reference disagrees with its hand-derived table");
-    const bool supported = dxr_fixture::supported(device);
-    check_shared_edge(device, supported);
+    const auto backend = usePipeline ? dxr_fixture::Backend::pipeline : dxr_fixture::Backend::inline_query;
+    const bool supported = dxr_fixture::supported(device, backend);
+    check_shared_edge(device, backend, supported);
     if (!supported) return false;
     std::vector<dxr_fixture::Vertex> vertices(mesh.begin(), mesh.end());
     std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances;
@@ -98,7 +99,10 @@ bool check_dxr_facing(ID3D12Device* device) {
         rays.push_back({probe.origin[0], probe.origin[1], probe.origin[2], probe.nearT,
                         probe.direction[0], probe.direction[1], probe.direction[2], probe.farT,
                         255, probe.flags | dxr_fixture::report_facing});
-    const auto words = dxr_fixture::trace(device, vertices, instances, rays);
+    const auto words = dxr_fixture::trace(device, vertices, instances, rays, backend);
+    // Reuse the unculled ray for each primitive and direction to predict the
+    // readback of a backend that silently dropped both face-cull flags.
+    UINT missingCullMismatches = 0;
     UINT hits = 0, frontHits = 0, mismatches = 0;
     for (UINT i = 0; i < rays.size(); ++i) {
         const auto expected = dxr_facing::closest(mesh, scene, probes[i]);
@@ -119,10 +123,14 @@ bool check_dxr_facing(ID3D12Device* device) {
         }
         hits += expected.hit;
         frontHits += expected.hit && expected.front;
+        const UINT* unculled = words.data() + 4 * (i - i % std::size(dxr_facing::rayFlags));
+        missingCullMismatches += unculled[0] != status;
     }
     std::printf("dxr_facing rays=%zu hits=%u front_hits=%u culled=%zu mismatches=%u\n",
                 rays.size(), hits, frontHits, rays.size() - hits, mismatches);
     if (mismatches) throw std::runtime_error("DXR facing or culling disagrees with the CPU reference");
     if (hits != 72 || frontHits != 36) throw std::runtime_error("Facing fixture lost its expected coverage");
+    std::printf("dxr_facing no_cull_control_status_mismatches=%u\n", missingCullMismatches);
+    if (missingCullMismatches != 24) throw std::runtime_error("Missing-cull control lost its expected coverage");
     return true;
 }

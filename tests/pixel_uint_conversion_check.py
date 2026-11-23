@@ -25,7 +25,8 @@ def check_forms():
     for instruction, diagnostic in (
         ("v_cvt_u32_f32_e32 v32, v3", "Unbound pixel input v3"),
         ("v_cvt_u32_f32_e32 v256, s4", "Invalid unsigned conversion register"),
-        ("v_cvt_u32_f32_e64 v32, |s4|", "Unsupported instruction"),
+        ("v_cvt_u32_f32_e64 v32, |s4|", "Invalid conversion"),
+        ("v_cvt_u32_f32_e64 v32, s4 clamp", "Unsupported instruction"),
         ("v_cvt_u32_f32_e32 v32, -s4", "Unsupported instruction"),
     ):
         try:

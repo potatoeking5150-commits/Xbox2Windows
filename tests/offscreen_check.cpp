@@ -3,6 +3,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cwchar>
 #include <fstream>
@@ -27,24 +28,6 @@ __declspec(dllexport) const char* D3D12SDKPath = ".\\D3D12\\";
 
 using Microsoft::WRL::ComPtr;
 constexpr UINT side = 64;
-
-void check(HRESULT hr, const char* stage)
-{
-    if (FAILED(hr)) {
-        std::fprintf(stderr, "%s failed (HRESULT 0x%08lx)\n", stage, static_cast<unsigned long>(hr));
-        throw std::runtime_error(stage);
-    }
-}
-
-HRESULT check_feature(ID3D12Device* device, D3D12_FEATURE feature, void* data, UINT size)
-{
-#if defined(OFFSCREEN_AGILITY_620) && defined(__ID3D12Device16_INTERFACE_DEFINED__)
-    ComPtr<ID3D12Device16> versioned;
-    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&versioned))))
-        return versioned->CheckFeatureSupport1(feature, data, size, D3D12SDKVersion);
-#endif
-    return device->CheckFeatureSupport(feature, data, size);
-}
 
 bool contains_ignoring_case(const wchar_t* text, const wchar_t* part)
 {
@@ -105,19 +88,6 @@ ComPtr<IDXGIAdapter1> select_adapter(IDXGIFactory6* factory, bool warp, ComPtr<I
             std::fprintf(stderr, "XBOX2WINDOWS_ADAPTER: skipping %ls\n", desc.Description);
         }
     }
-}
-
-ComPtr<ID3D12Resource> resource(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc,
-                               D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state,
-                               const D3D12_CLEAR_VALUE* clear)
-{
-    D3D12_HEAP_PROPERTIES props{};
-    props.Type = heap;
-    props.CreationNodeMask = props.VisibleNodeMask = 1;
-    ComPtr<ID3D12Resource> result;
-    check(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, state, clear,
-                                          IID_PPV_ARGS(&result)), "Create resource");
-    return result;
 }
 
 void save_bitmap(const char* path, const std::vector<BYTE>& bgra)
@@ -458,6 +428,13 @@ bool validate_compute_mesh_texture_args(int argc, char** argv)
     return argc != 9 || std::string_view(argv[8]) == "--stale";
 }
 
+bool validate_compute_mesh_texture_fallback_args(int argc, char** argv)
+{
+    return std::string_view(argv[7]) != "--stale" &&
+           (argc < 9 || std::string_view(argv[8]) != "--stale") &&
+           (argc != 10 || std::string_view(argv[9]) == "--stale");
+}
+
 OperationResult run_check_pixel_batch(const OperationContext& ctx)
 {
     bool failed = false;
@@ -529,6 +506,12 @@ OperationResult run_spirv_compare_sampler(const OperationContext& ctx)
 {
     check_spirv_compare_sampler(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
                                 ctx.argc == 7 ? ctx.argv[6] : nullptr);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_compaction(const OperationContext& ctx)
+{
+    check_spirv_compaction(ctx.device, ctx.argv[3]);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -641,6 +624,28 @@ OperationResult run_check_pixel_quad_lod(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_check_pixel_mip_clamp(const OperationContext& ctx)
+{
+    const std::string_view level = ctx.argv[4];
+    if (level.size() != 1 || level[0] < '0' || level[0] > '3')
+        throw std::runtime_error("Expected a mip level from 0 to 3");
+    check_pixel_mip_clamp(ctx.device, ctx.argv[3], unsigned(level[0] - '0'));
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel_mip_blend(const OperationContext& ctx)
+{
+    const auto number = [](std::string_view text) {
+        float value = 0;
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (error != std::errc{} || end != text.data() + text.size())
+            throw std::runtime_error("Expected a decimal clamp and tolerance");
+        return value;
+    };
+    check_pixel_mip_blend(ctx.device, ctx.argv[3], number(ctx.argv[4]), number(ctx.argv[5]));
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_check_pixel(const OperationContext& ctx)
 {
     check_translated_pixel(ctx.device, ctx.argv[3], std::string_view(ctx.argv[4]) == "bgra");
@@ -672,6 +677,18 @@ OperationResult run_mesh_indexed(const OperationContext& ctx)
     return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], true));
 }
 
+OperationResult run_mesh_indexed_fallback(const OperationContext& ctx)
+{
+    check_mesh_fallback_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_mesh_textured_fallback(const OperationContext& ctx)
+{
+    check_mesh_fallback_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6], MeshDrawMode::textured);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_mesh_entry_table(const OperationContext& ctx)
 {
     const auto binding = ctx.argc == 7 ? MeshConstantBinding::swapped_table : MeshConstantBinding::table;
@@ -691,10 +708,24 @@ OperationResult run_compute_mesh_texture(const OperationContext& ctx)
                                                true, MeshConstantBinding::root, MeshDrawMode::textured, &producers));
 }
 
+OperationResult run_compute_mesh_texture_fallback(const OperationContext& ctx)
+{
+    const MeshTextureProducers producers{ctx.argv[7], ctx.argc >= 9 ? ctx.argv[8] : nullptr, ctx.argc == 10};
+    check_mesh_fallback_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6],
+                             MeshDrawMode::textured, &producers);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_mesh_depth_pair(const OperationContext& ctx)
 {
     return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
                                                true, MeshConstantBinding::root, MeshDrawMode::depth_pair));
+}
+
+OperationResult run_mesh_depth_pair_fallback(const OperationContext& ctx)
+{
+    check_mesh_fallback_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6], MeshDrawMode::depth_pair);
+    return {OutcomeKind::pass, nullptr};
 }
 
 OperationResult run_mesh_shadow(const OperationContext& ctx)
@@ -766,17 +797,32 @@ OperationResult run_bvh_wave64(const OperationContext& ctx)
 
 OperationResult run_dxr_update(const OperationContext& ctx)
 {
-    return skip_if_false(check_dxr_update(ctx.device));
+    return skip_if_false(check_dxr_update(ctx.device, false));
+}
+
+OperationResult run_dxr_update_pipeline(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_update(ctx.device, true));
 }
 
 OperationResult run_dxr_facing(const OperationContext& ctx)
 {
-    return skip_if_false(check_dxr_facing(ctx.device));
+    return skip_if_false(check_dxr_facing(ctx.device, false));
+}
+
+OperationResult run_dxr_facing_pipeline(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_facing(ctx.device, true));
 }
 
 OperationResult run_dxr_opacity(const OperationContext& ctx)
 {
-    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp"));
+    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", false));
+}
+
+OperationResult run_dxr_opacity_pipeline(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", true));
 }
 
 OperationResult run_ray_query(const OperationContext& ctx)
@@ -804,6 +850,18 @@ OperationResult run_gpu_alias_lookup_writes(const OperationContext& ctx)
     return skip_if_false(check_gpu_alias_lookup_writes(ctx.device));
 }
 
+OperationResult run_gpu_alias_atomic_waterfall(const OperationContext& ctx)
+{
+    if (!check_gpu_alias_atomic_waterfall(ctx.device))
+        return {OutcomeKind::fail, "Waterfall atomic counts differ from the reference"};
+    return {OutcomeKind::pass, nullptr};
+}
+OperationResult run_gpu_alias_atomic_returns(const OperationContext& ctx)
+{
+    if (!check_gpu_alias_atomic_returns(ctx.device))
+        return {OutcomeKind::fail, "Waterfall atomic return values are incorrect"};
+    return {OutcomeKind::pass, nullptr};
+}
 OperationResult run_gpu_alias_registry(const OperationContext& ctx)
 {
     return skip_if_false(check_gpu_alias_registry(ctx.device));
@@ -839,21 +897,41 @@ constexpr CapabilityGate kGateWaveShuffle{
     D3D_SHADER_MODEL_6_5, false, true, 0,
     "skip: wave shuffle fixture requires SM 6.5 and WaveOps",
     CapsDiagnostic::wave_6_6};
+constexpr CapabilityGate kGateSm60MeshFallback{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: mesh fallback requires SM 6.0",
+    CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm60SamplerViews{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: sampler fixture requires SM 6.0",
     CapsDiagnostic::none};
-constexpr CapabilityGate kGateSm66CompareSampler{
-    D3D_SHADER_MODEL_6_6, false, false, 0,
-    "skip: comparison-sampler fixture requires SM 6.6",
+constexpr CapabilityGate kGateSm60CompareSampler{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: comparison-sampler fixture requires SM 6.0",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateAddressWindow{
-    D3D_SHADER_MODEL_6_6, true, false, 0,
-    "skip: address window fixture requires SM 6.6 and 64-bit shader integer operations",
+    D3D_SHADER_MODEL_6_0, true, false, 0,
+    "skip: address window fixture requires SM 6.0 and 64-bit shader integer operations",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm66Ballot{
     D3D_SHADER_MODEL_6_6, false, false, 0,
     "skip: ballot fixture requires SM 6.6",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm60AtomicWaterfall{
+    D3D_SHADER_MODEL_6_0, false, true, 0,
+    "skip: atomic waterfall diagnostic requires SM 6.0 and WaveOps",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm60Compaction{
+    D3D_SHADER_MODEL_6_0, false, true, 0,
+    "skip: subgroup compaction fixture requires SM 6.0 and WaveOps",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm60MinLodSmoke{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: MinLod smoke fixture requires SM 6.0",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm66MinLod{
+    D3D_SHADER_MODEL_6_6, false, false, 0,
+    "skip: MinLod fixture requires SM 6.6",
     CapsDiagnostic::none};
 
 // Static argument shapes and unconditional adapter prerequisites for every named operation.
@@ -868,9 +946,10 @@ const OperationSpec kOperations[] = {
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
-    {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm66CompareSampler, run_spirv_compare_sampler},
+    {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm60CompareSampler, run_spirv_compare_sampler},
     // The SPIR-V ballot fixture compiles cs_6_6; it uses the compute-store readback behind an SM 6.6 gate.
     {"--spirv-ballot", 5, 5, nullptr, kGateSm66Ballot, run_compute_store_case},
+    {"--spirv-compaction", 4, 4, nullptr, kGateSm60Compaction, run_spirv_compaction},
     {"--ffx-device-init", 3, 3, nullptr, kNoGate, run_ffx_device_init},
     {"--ffx-provider-loop", 3, 3, nullptr, kNoGate, run_ffx_provider_loop},
     {"--ffx-recurrent", 3, 3, nullptr, kNoGate, run_ffx_recurrent},
@@ -889,15 +968,24 @@ const OperationSpec kOperations[] = {
     {"--check-pixel-attribute", 5, 5, nullptr, kNoGate, run_check_pixel_attribute},
     {"--check-pixel-attribute-rg", 5, 5, nullptr, kNoGate, run_check_pixel_attribute_rg},
     {"--check-pixel-quad-lod", 4, 4, nullptr, kNoGate, run_check_pixel_quad_lod},
+    {"--spirv-minlod-quad-lod", 4, 4, nullptr, kGateSm60MinLodSmoke, run_check_pixel_quad_lod},
+    // The detailed MinLod level and blend fixtures compile ps_6_6.
+    {"--check-pixel-mip-clamp", 5, 5, nullptr, kGateSm66MinLod, run_check_pixel_mip_clamp},
+    {"--check-pixel-mip-blend", 6, 6, nullptr, kGateSm66MinLod, run_check_pixel_mip_blend},
     {"--check-pixel", 5, 5, validate_check_pixel_args, kNoGate, run_check_pixel},
     {"--depth-mask", 6, 6, nullptr, kNoGate, run_depth_mask},
     {"--depth-mask-swapped", 6, 6, nullptr, kNoGate, run_depth_mask_swapped},
     {"--mesh-entry", 6, 7, validate_mesh_entry_args, kNoGate, run_mesh_entry},
     {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
+    {"--mesh-indexed-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_indexed_fallback},
+    {"--mesh-textured-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_textured_fallback},
     {"--mesh-entry-table", 6, 7, validate_mesh_entry_table_args, kNoGate, run_mesh_entry_table},
     {"--mesh-textured", 6, 6, nullptr, kNoGate, run_mesh_textured},
     {"--compute-mesh-texture", 7, 9, validate_compute_mesh_texture_args, kNoGate, run_compute_mesh_texture},
+    {"--compute-mesh-texture-fallback", 8, 10, validate_compute_mesh_texture_fallback_args,
+     kGateSm60MeshFallback, run_compute_mesh_texture_fallback},
     {"--mesh-depth-pair", 6, 6, nullptr, kNoGate, run_mesh_depth_pair},
+    {"--mesh-depth-pair-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_depth_pair_fallback},
     {"--mesh-shadow", 7, 8, validate_mesh_shadow_args, kNoGate, run_mesh_shadow},
     {"--bvh-root-roundtrip", 3, 3, nullptr, kNoGate, run_bvh_root_roundtrip},
     {"--bvh-differential", 3, 3, nullptr, kNoGate, run_bvh_differential},
@@ -910,13 +998,18 @@ const OperationSpec kOperations[] = {
     {"--bvh-waves", 3, 3, nullptr, kGateSm65, run_bvh_waves},
     {"--bvh-wave64", 3, 3, nullptr, kGateWave64, run_bvh_wave64},
     {"--dxr-update", 3, 3, nullptr, kNoGate, run_dxr_update},
+    {"--dxr-update-pipeline", 3, 3, nullptr, kNoGate, run_dxr_update_pipeline},
     {"--dxr-facing", 3, 3, nullptr, kNoGate, run_dxr_facing},
+    {"--dxr-facing-pipeline", 3, 3, nullptr, kNoGate, run_dxr_facing_pipeline},
     {"--dxr-opacity", 3, 3, nullptr, kNoGate, run_dxr_opacity},
+    {"--dxr-opacity-pipeline", 3, 3, nullptr, kNoGate, run_dxr_opacity_pipeline},
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
     {"--dxr-pipeline", 3, 3, nullptr, kNoGate, run_dxr_pipeline},
     {"--gpu-alias", 3, 3, nullptr, kNoGate, run_gpu_alias},
     {"--gpu-alias-lookup", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup},
     {"--gpu-alias-lookup-writes", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup_writes},
+    {"--gpu-alias-atomic-waterfall", 3, 3, nullptr, kGateSm60AtomicWaterfall, run_gpu_alias_atomic_waterfall},
+    {"--gpu-alias-atomic-returns", 3, 3, nullptr, kGateSm60AtomicWaterfall, run_gpu_alias_atomic_returns},
     {"--gpu-alias-registry", 3, 3, nullptr, kNoGate, run_gpu_alias_registry},
     {"--buffer-ops", 3, 3, nullptr, kGateSm60BufferOps, run_buffer_ops},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
@@ -1107,6 +1200,10 @@ int run_self_test()
                    "Unknown GPU operation or invalid arguments: --check-pixel")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-entry", "a", "b", "c", "invalid"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --mesh-entry")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-indexed-fallback", "cs", "vs", "ps"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --mesh-indexed-fallback")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-depth-pair-fallback", "cs", "vs", "ps"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --mesh-depth-pair-fallback")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-entry-table", "a", "b", "c", "--bad"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --mesh-entry-table")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--compute-mesh-texture", "a", "b", "c", "d", "e", "--bad"},
@@ -1117,6 +1214,8 @@ int run_self_test()
     if (!check_cli({"offscreen_check", "warp", "out.bmp"}, CliAction::draw)) return 1;
     if (!check_cli({"offscreen_check", "hardware", "out.bmp", "vs.cso", "ps.cso"}, CliAction::draw)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--check-pixel", "a.cso", "bgra"}, CliAction::operation)) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-indexed-fallback", "cs", "vs", "ps", "fixture"},
+                   CliAction::operation)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5", "ref.bin"},
                    CliAction::operation)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-ballot", "a.dxil", "case.bin"}, CliAction::operation)) return 1;
@@ -1169,6 +1268,33 @@ int run_self_test()
         if (!require(out.find("native_lane_range=32..32 shader_model_capped_at_6_6=0x66") != std::string::npos,
                      "unmet wave64 gate must preserve native_lane_range diagnostic")) return 1;
 
+        const OperationSpec* depth_pair = find_operation("--mesh-depth-pair-fallback");
+        if (!require(depth_pair != nullptr, "--mesh-depth-pair-fallback operation")) return 1;
+        const AdapterCaps sm51_caps{D3D_SHADER_MODEL_5_1};
+        char depth_pair_op[] = "--mesh-depth-pair-fallback";
+        char cs[] = "cs.dxil";
+        char vs[] = "vs.dxil";
+        char ps[] = "ps.dxil";
+        char fixture[] = "depth.case";
+        char* depth_pair_argv[]{prog, mode, depth_pair_op, cs, vs, ps, fixture};
+        OperationContext dctx{nullptr, nullptr, sm51_caps, "warp", 7, depth_pair_argv, nullptr};
+        out.clear();
+        err.clear();
+        if (!require(run_operation_spec(*depth_pair, dctx, {&out, &err}) == 77,
+                     "--mesh-depth-pair-fallback below SM 6.0 must exit 77")) return 1;
+        if (!require(out.find("skip: mesh fallback requires SM 6.0") != std::string::npos,
+                     "--mesh-depth-pair-fallback must print its skip reason")) return 1;
+
+        const OperationSpec* compare_sampler = find_operation("--spirv-compare-sampler");
+        if (!require(compare_sampler != nullptr, "--spirv-compare-sampler operation")) return 1;
+        const AdapterCaps sm60_caps{D3D_SHADER_MODEL_6_0};
+        if (!require(evaluate_gate(compare_sampler->gate, sm60_caps), "comparison sampler accepts SM 6.0"))
+            return 1;
+        out.clear();
+        if (!require(!evaluate_gate(compare_sampler->gate, sm51_caps, {&out, &err}) &&
+                     out.find("skip: comparison-sampler fixture requires SM 6.0") != std::string::npos,
+                     "comparison sampler requires SM 6.0 and prints its skip reason")) return 1;
+
         // The ballot fixture skips on a runtime capped at SM 6.5, as the Windows 10 in-box runtime is (#751).
         const OperationSpec* ballot = find_operation("--spirv-ballot");
         if (!require(ballot != nullptr, "--spirv-ballot operation")) return 1;
@@ -1183,6 +1309,70 @@ int run_self_test()
             return 1;
         if (!require(out.find("skip: ballot fixture requires SM 6.6") != std::string::npos,
                      "--spirv-ballot must print its skip reason")) return 1;
+
+        const OperationSpec* compaction = find_operation("--spirv-compaction");
+        if (!require(compaction != nullptr, "--spirv-compaction operation")) return 1;
+        const AdapterCaps sm60_waves{D3D_SHADER_MODEL_6_0, false, true, 4, 4};
+        const AdapterCaps sm60_no_waves{D3D_SHADER_MODEL_6_0, false, false, 0, 0};
+        const AdapterCaps sm51_waves{D3D_SHADER_MODEL_5_1, false, true, 32, 32};
+        if (!require(evaluate_gate(compaction->gate, sm60_waves), "compaction accepts SM 6.0 with WaveOps"))
+            return 1;
+        for (const AdapterCaps& unmet : {sm60_no_waves, sm51_waves}) {
+            out.clear();
+            if (!require(!evaluate_gate(compaction->gate, unmet, {&out, &err}) &&
+                         out.find("skip: subgroup compaction fixture requires SM 6.0 and WaveOps") != std::string::npos,
+                         "compaction requires both SM 6.0 and WaveOps"))
+                return 1;
+        }
+
+        const OperationSpec* address_window = find_operation("--spirv-address-window");
+        if (!require(address_window != nullptr, "--spirv-address-window operation")) return 1;
+        const AdapterCaps sm60_int64{D3D_SHADER_MODEL_6_0, true};
+        const AdapterCaps sm51_int64{D3D_SHADER_MODEL_5_1, true};
+        if (!require(evaluate_gate(address_window->gate, sm60_int64), "address window accepts SM 6.0 with Int64ShaderOps"))
+            return 1;
+        for (const AdapterCaps& unmet : {sm60_no_waves, sm51_int64}) {
+            out.clear();
+            if (!require(!evaluate_gate(address_window->gate, unmet, {&out, &err}) &&
+                         out.find("skip: address window fixture requires SM 6.0 and 64-bit shader integer operations") !=
+                             std::string::npos,
+                         "address window requires both SM 6.0 and Int64ShaderOps"))
+                return 1;
+        }
+
+        // The MinLod draws skip the same way instead of failing at ps_6_6 pipeline creation.
+        char clamp_op[] = "--check-pixel-mip-clamp";
+        char blend_op[] = "--check-pixel-mip-blend";
+        char level[] = "1";
+        char tolerance[] = "0.0078125";
+        char* clamp_argv[]{prog, mode, clamp_op, dxil, level};
+        char* blend_argv[]{prog, mode, blend_op, dxil, level, tolerance};
+        const struct { char** argv; int argc; } minlod_cases[]{{clamp_argv, 5}, {blend_argv, 6}};
+        for (const auto& c : minlod_cases) {
+            const OperationSpec* spec = find_operation(c.argv[2]);
+            if (!require(spec != nullptr, "MinLod operation")) return 1;
+            OperationContext mctx{nullptr, nullptr, low_caps, "warp", c.argc, c.argv, nullptr};
+            out.clear();
+            err.clear();
+            if (!require(run_operation_spec(*spec, mctx, {&out, &err}) == 77, "MinLod draw below SM 6.6 must exit 77"))
+                return 1;
+            if (!require(out.find("skip: MinLod fixture requires SM 6.6") != std::string::npos,
+                         "MinLod draw must print its skip reason")) return 1;
+        }
+
+        // The MinLod smoke draw accepts SM 6.0 without wave or int64 operations.
+        char quad_op[] = "--spirv-minlod-quad-lod";
+        char* quad_argv[]{prog, mode, quad_op, dxil};
+        const OperationSpec* quad = find_operation(quad_op);
+        if (!require(quad != nullptr, "MinLod smoke operation")) return 1;
+        if (!require(evaluate_gate(quad->gate, sm60_caps), "MinLod smoke draw must accept SM 6.0")) return 1;
+        OperationContext qctx{nullptr, nullptr, sm51_caps, "warp", 4, quad_argv, nullptr};
+        out.clear();
+        err.clear();
+        if (!require(run_operation_spec(*quad, qctx, {&out, &err}) == 77,
+                     "MinLod smoke draw below SM 6.0 must exit 77")) return 1;
+        if (!require(out.find("skip: MinLod smoke fixture requires SM 6.0") != std::string::npos,
+                     "MinLod smoke draw must print its skip reason")) return 1;
     }
 
     // (c) Handler OutcomeKind::fail and thrown exception exit 1 (never 77); OutcomeKind::skip exits 77; pass exits 0.

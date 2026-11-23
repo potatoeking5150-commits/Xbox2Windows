@@ -56,12 +56,18 @@ def scalar_writes(line):
         return ()
     if re.fullmatch(r"s_setreg_imm32_b32 hwreg\(HW_REG_MODE, 2, 2\), [03]", line):
         return ()
-    if line == "s_wqm_b64 exec, exec":
+    if line in ("s_wqm_b64 exec, exec", "s_wqm_b64 exec_lo, exec_lo",
+                "s_wqm_b32 exec_lo, exec_lo", "s_wqm_b32 exec, exec"):
+        return ()
+    if op in ("s_and_b64", "s_and_b32") and dest in ("exec", "exec_lo"):
         return ()
     if op in ("s_mov_b32", "s_mov_b64", "s_movk_i32", "s_add_i32", "s_brev_b32",
               "s_load_dwordx4", "s_load_dwordx8"):
-        if dest == "m0":
+        if dest in ("m0", "exec", "exec_lo"):
             return ()
+        if op == "s_mov_b64" and re.fullmatch(r"s\d+", dest):
+            n = int(dest[1:])
+            return range(n, n + 2)
         if regs := written_registers(dest):
             return regs
     return None

@@ -108,8 +108,11 @@ a bound range only at its start; the callee is walked within that range alone,
 may not move RSP or call, and may not be an import thunk.
 
 A call or tail jump through the import address table is translated only through
-an explicit binding (--bind, --import-arguments, --return-bytes): one IAT slot
-for all functions of a run, which must hold the import that the binding names.
+an explicit binding (--bind, --import-arguments, --return-bytes). One binding
+covers one IAT slot for all functions of a run, which must hold the import that
+the binding names. With several --bind options, each names a distinct ordinary
+import of the image and binds the slot that holds it; a reached slot that no
+binding names is refused, as is a binding that no call or tail jump uses.
 It may be reached by call or jmp QWORD PTR [rip+slot], or by a direct CALL or
 JMP of an import thunk: the six bytes FF 25 disp32 at a target outside every
 unwind interval and bound range, read as a call or tail jump through their
@@ -172,6 +175,7 @@ STRAIGHT = (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH, FlowControl.CALL, 
 MAX_CALLEES = 256
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
 SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
+ROTATES = {M.ROL: "true", M.ROR: "false"}
 _CODES = "O NO B AE E NE BE A S NS P NP L GE LE G".split()
 SETCC = {getattr(M, "SET" + code) for code in _CODES}
 CMOVCC = {getattr(M, "CMOV" + code) for code in _CODES}
@@ -1080,12 +1084,14 @@ class Lifter:
                 self.flags = True
                 line = f"fa = static_cast<{unsigned(width)}>({value}); " + line
             return line, reads, writes
-        if mnemonic in SHIFTS:
+        if mnemonic in (*SHIFTS, *ROTATES):
+            if sets_flags:
+                raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}")
             note(0)
             a = self.operand(ins, 0, width)
-            # x86 masks the count to six bits for 64-bit operands and to five bits otherwise, so an
-            # 8- or 16-bit destination can be shifted by up to 31. The shift is done in 64 bits
-            # (count < 64, no host overflow) and the write truncates the result to the destination.
+            # x86 masks the count to six bits for 64-bit operands and to five bits otherwise.
+            # Shifts widen to 64 bits (count < 64, no host overflow) and truncate on write;
+            # rotates mask modulo the operand width inside rotate_bits.
             mask = 63 if width == 8 else 31
             if ins.op1_kind == OpKind.REGISTER:
                 if ins.op1_register != R.CL:
@@ -1094,11 +1100,15 @@ class Lifter:
                 count = f"({self.reg(R.RCX)} & {mask}u)"
             else:
                 count = f"{ins.immediate(1) & mask}u"
-            if mnemonic == M.SAR:
-                a = f"static_cast<std::int64_t>(static_cast<{signed(width)}>({a}))"
+            if mnemonic in ROTATES:
+                value = f"rotate_bits<{unsigned(width)}>({a}, {count}, {ROTATES[mnemonic]})"
             else:
-                a = f"static_cast<std::uint64_t>({a})"
-            return self.write(ins, width, f"{a} {SHIFTS[mnemonic]} {count}"), reads, writes
+                if mnemonic == M.SAR:
+                    a = f"static_cast<std::int64_t>(static_cast<{signed(width)}>({a}))"
+                else:
+                    a = f"static_cast<std::uint64_t>({a})"
+                value = f"{a} {SHIFTS[mnemonic]} {count}"
+            return self.write(ins, width, value), reads, writes
         if mnemonic == M.IMUL and ins.op_count in (2, 3):
             # The two-operand form reads its destination; the three-operand form only writes it.
             if ins.op_count == 2:
@@ -1745,6 +1755,14 @@ static inline bool even_parity(word value) {
     const auto folded = static_cast<unsigned>((value ^ (value >> 4)) & 15u);
     return ((0x6996u >> folded) & 1u) == 0;
 }
+template <class T> static inline T rotate_bits(T value, word count, bool left) {
+    const unsigned bits = static_cast<unsigned>(sizeof(T) * 8);
+    const unsigned shift = static_cast<unsigned>(count & (bits - 1));
+    if (!shift) return value;
+    const unsigned amount = left ? shift : bits - shift;
+    const word wide = value;
+    return static_cast<T>((wide << amount) | (wide >> (bits - amount)));
+}
 // A read of the function's own frame array, which cannot fault.
 template <class T> static T load(word address) {
     T value;
@@ -1885,40 +1903,118 @@ def load_bindings(source):
     return {"image_sha256": digest, "functions": functions}
 
 
+def import_identities(pe):
+    """(DLL, name or "#ordinal") of each ordinary import by its IAT slot RVA, named as resolve_import names it."""
+    pe.parse_data_directories(directories=[1])  # ordinary import directory
+    return {imp.address - pe.OPTIONAL_HEADER.ImageBase:
+            (desc.dll.decode("ascii"), f"#{imp.ordinal}" if imp.import_by_ordinal else imp.name.decode("ascii"))
+            for desc in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) for imp in desc.imports}
+
+
 def translate_pe(pe, names, bindings=None, *, image_data=False, binding=None):
+    """binding is one Binding or a sequence of them; with several, each binds the IAT slot of the import it names."""
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
     if image_data and {"bind_image", "unbind_image"} & {parse_entry(name)[0] for name in names}:
         raise ValueError("an export named bind_image or unbind_image collides with the image binding functions")
     program = Program(pe, None if bindings is None else load_bindings(bindings), image_data=image_data)
-    slots = {}
-    if binding is not None:
-        if binding.arguments not in ARGUMENT_COUNTS or binding.return_bytes not in (0, 1, 2, 8):
-            raise ValueError(f"unsupported binding of {binding.symbol}")
-
+    bound = () if binding is None else (binding,) if isinstance(binding, Binding) else tuple(binding)
+    for item in bound:
+        if item.arguments not in ARGUMENT_COUNTS or item.return_bytes not in (0, 1, 2, 8):
+            raise ValueError(f"unsupported binding of {item.symbol}")
+    # With several bindings, each names one ordinary import of the image and a slot takes the binding of its import.
+    imported = import_identities(pe) if len(bound) > 1 else {}
+    by_import = {}
+    for index, item in enumerate(bound if len(bound) > 1 else ()):
+        key = (Path(item.provider).name.casefold(), item.symbol)
+        if key in by_import:
+            raise ValueError(f"two bindings of {Path(item.provider).name}!{item.symbol}")
+        if key not in {(dll.casefold(), name) for dll, name in imported.values()}:
+            raise ValueError(f"binding {Path(item.provider).name}!{item.symbol} names no ordinary import of the image")
+        by_import[key] = index
+    slots, chosen = {}, {}  # slot -> HostImport, slot -> index of its binding
+    if bound:
         def resolve_slot(slot):
-            if slots and slot not in slots:
-                raise ValueError(f"call or tail jump through a second IAT slot RVA {slot:#x}")
-            symbol = resolve_import(pe, slot, Path(binding.provider), binding.symbol, binding.link_name)
+            if len(bound) == 1:
+                if slots and slot not in slots:
+                    raise ValueError(f"call or tail jump through a second IAT slot RVA {slot:#x}")
+                index = 0
+            else:
+                if slot not in imported:
+                    raise ValueError(f"RIP-relative target RVA {slot:#x} is not an ordinary IAT slot")
+                dll, name = imported[slot]
+                index = by_import.get((dll.casefold(), name))
+                if index is None:
+                    raise ValueError(f"call or tail jump through IAT slot RVA {slot:#x} ({dll}!{name}) matches "
+                                     "no binding")
+            item = bound[index]
+            symbol = resolve_import(pe, slot, Path(item.provider), item.symbol, item.link_name)
             # The translation calls the import instead of reading the slot; the original's read must not fault.
             if not any(s.VirtualAddress <= slot and slot + 8 <= s.VirtualAddress + extent(s)
                        and s.Characteristics & SCN_READ for s in pe.sections):
                 raise ValueError(f"IAT slot RVA {slot:#x} is not 8 bytes of one readable section")
-            slots[slot] = HostImport(symbol, (8,) * binding.arguments, binding.return_bytes)
+            slots[slot], chosen[slot] = HostImport(symbol, (8,) * item.arguments, item.return_bytes), index
             return slots[slot]
         program.import_resolver = resolve_slot
     functions = [lift(pe, *parse_entry(name), program=program) for name in names]
     # Callees precede every caller, so each internal function is defined before its first use.
     sources = program.sources + [source for source, _ in functions]
-    declarations = ""
-    if binding is not None:
-        if not slots:
-            raise ValueError(f"binding {Path(binding.provider).name}!{binding.symbol} supplied but no call or "
+    lines = []
+    for index, item in enumerate(bound):
+        used = [slot for slot, owner in chosen.items() if owner == index]
+        if not used:
+            raise ValueError(f"binding {Path(item.provider).name}!{item.symbol} supplied but no call or "
                              "tail jump uses it")
-        symbol = next(iter(slots.values())).symbol
-        params = ", ".join(["word"] * binding.arguments)
-        declarations = f'\nextern "C" __declspec(dllimport) word {symbol}({params});\n'
+        lines.append((min(used), slots[min(used)].symbol, item))
+    # Declared in IAT slot order, so the source does not depend on the order of the bindings.
+    lines = [(symbol, item) for _, symbol, item in sorted(lines, key=lambda line: line[0])]
+    for (symbol, item), (other, earlier) in ((a, b) for n, a in enumerate(lines) for b in lines[:n]):
+        if symbol == other:
+            raise ValueError(f"bindings {Path(earlier.provider).name}!{earlier.symbol} and "
+                             f"{Path(item.provider).name}!{item.symbol} both declare the C name {symbol}")
+    declarations = "".join(f'\nextern "C" __declspec(dllimport) word {symbol}({", ".join(["word"] * item.arguments)});'
+                           for symbol, item in lines) + "\n" if lines else ""
     return PRELUDE + declarations + (image_block(pe) if image_data else "") + "\n".join(f"\n{source}" for source in sources) + "\n", [f for _, f in functions]
+
+
+class BindingOption(argparse.Action):
+    """Records --bind, --link-name, --import-arguments and --return-bytes in command-line order."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        # The canonical spelling: argparse also accepts an abbreviation such as --return.
+        namespace.binding_options = [*namespace.binding_options, (self.option_strings[0], values)]
+
+
+def parse_binding_options(options):
+    """None, one Binding or a tuple of them from the recorded binding options. With one --bind the other options
+    may appear anywhere, the last of each counting, as before; with several, each belongs to the --bind before it."""
+    binds = sum(option == "--bind" for option, _ in options)
+    if binds < 2:
+        group = dict(options)  # the last value of each option counts
+        if not binds:
+            if group:
+                raise ValueError("--link-name, --import-arguments and --return-bytes require --bind")
+            return None
+        groups = [group]
+    else:
+        groups = []
+        for option, value in options:
+            if option == "--bind":
+                groups.append({option: value})
+            elif not groups:
+                raise ValueError(f"{option} comes before the first of several --bind options")
+            elif option in groups[-1]:
+                raise ValueError(f"{option} given twice for --bind {' '.join(groups[-1]['--bind'])}")
+            else:
+                groups[-1][option] = value
+    found = []
+    for group in groups:
+        if "--import-arguments" not in group or "--return-bytes" not in group:
+            raise ValueError("--bind requires --import-arguments and --return-bytes")
+        provider, symbol = group["--bind"]
+        found.append(Binding(Path(provider), symbol, group.get("--link-name"), group["--import-arguments"],
+                             group["--return-bytes"]))
+    return found[0] if len(found) == 1 else tuple(found)
 
 
 def translate(image, names, bindings=None, *, image_data=False, binding=None):
@@ -1937,25 +2033,25 @@ if __name__ == "__main__":
                              "binds at run time with lifted_bind_image; the generated source states the contract")
     parser.add_argument("--bind-ranges", type=Path, metavar="MANIFEST",
                         help="trusted [start, end) ranges of functions without unwind data, bound to this image's sha256")
-    parser.add_argument("--bind", nargs=2, metavar=("PROVIDER_DLL", "SYMBOL"),
+    parser.set_defaults(binding_options=[])
+    parser.add_argument("--bind", nargs=2, metavar=("PROVIDER_DLL", "SYMBOL"), action=BindingOption,
                         help="provider and export name or #ordinal of the import that calls and tail jumps "
                              "through the import address table reach. The image and target must stay valid and "
-                             "the original slot must stay readable and contain that target throughout execution")
-    parser.add_argument("--link-name", help="local import-library symbol for an ordinal binding")
-    parser.add_argument("--import-arguments", type=int, choices=ARGUMENT_COUNTS,
+                             "the original slot must stay readable and contain that target throughout execution. "
+                             "Repeat it to bind several imports, each followed by its own options below")
+    parser.add_argument("--link-name", action=BindingOption,
+                        help="local import-library symbol for an ordinal binding")
+    parser.add_argument("--import-arguments", type=int, choices=ARGUMENT_COUNTS, action=BindingOption,
                         help="integer arguments the bound import takes; stated by the binding, not derived from "
                              "the provider (required with --bind)")
-    parser.add_argument("--return-bytes", type=int, choices=(0, 1, 2, 8),
+    parser.add_argument("--return-bytes", type=int, choices=(0, 1, 2, 8), action=BindingOption,
                         help="guaranteed low RAX bytes of the bound import's return, 0 for none; stated by "
                              "the binding, not derived from the provider (required with --bind)")
     args = parser.parse_args()
-    binding = None
-    if args.bind:
-        if args.import_arguments is None or args.return_bytes is None:
-            parser.error("--bind requires --import-arguments and --return-bytes")
-        binding = Binding(Path(args.bind[0]), args.bind[1], args.link_name, args.import_arguments, args.return_bytes)
-    elif args.link_name is not None or args.import_arguments is not None or args.return_bytes is not None:
-        parser.error("--link-name, --import-arguments and --return-bytes require --bind")
+    try:
+        binding = parse_binding_options(args.binding_options)
+    except ValueError as error:
+        parser.error(str(error))
     try:
         source, functions = translate(args.image, args.exports.split(","), args.bind_ranges, image_data=args.image_data, binding=binding)
         args.output.write_text(source, encoding="utf-8")

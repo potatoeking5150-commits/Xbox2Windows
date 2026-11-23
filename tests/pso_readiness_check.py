@@ -50,7 +50,11 @@ def check_scanner_tracks_pixel_aot():
         assert is_opcode_recognized(opcode), opcode
         operands = ", ".join(f"v{k}" for k in range(1, arity + 2))
         assert is_instruction_supported(f"{opcode} {operands}"), opcode
-        if arity <= 2:
+        if name in pixel_aot.INTEGER_VOP3_ONLY:
+            # Two sources, but no VOP2 encoding on gfx10: the e32 spelling stays unsupported.
+            assert not is_instruction_supported(f"{opcode}_e32 {operands}"), opcode
+            assert is_instruction_supported(f"{opcode}_e64 {operands}"), opcode
+        elif arity <= 2:
             assert is_opcode_recognized(opcode + "_e32"), opcode
             assert is_instruction_supported(f"{opcode}_e32 {operands}"), opcode
     for name, (arity, _, _) in pixel_aot.SCALAR.items():
@@ -70,6 +74,16 @@ def check_scanner_tracks_pixel_aot():
         opcode = f"v_pk_{name}"
         assert is_opcode_recognized(opcode), opcode
         assert is_instruction_supported(f"{opcode} v0, v1, v2"), opcode
+    assert len(pixel_aot.VOP3_INT16) == 12
+    for name in pixel_aot.VOP3_INT16:
+        opcode = f"v_{name}"
+        assert is_opcode_recognized(opcode), opcode
+        assert is_instruction_supported(f"{opcode} v1, v2, v3"), opcode
+    assert len(pixel_aot.VOP3_INT16_TERNARY) == 8
+    for name in pixel_aot.VOP3_INT16_TERNARY:
+        opcode = f"v_{name}"
+        assert is_opcode_recognized(opcode), opcode
+        assert is_instruction_supported(f"{opcode} v1, v2, v3, v4"), opcode
     for op in ("v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16"):
         assert is_opcode_recognized(op), op
         assert is_instruction_supported(f"{op} v1, v2, v3, v4"), op
